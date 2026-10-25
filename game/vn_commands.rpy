@@ -157,12 +157,6 @@ init -40 python:
         if remaining > 0.005:
             renpy.store.vn_wait_until = end
             renpy.pause(remaining, hard=True)
-        # FGO deactivates the wipe mesh after a completed wipein. Keep a
-        # completed wipeout in place so the script can change the stage under it.
-        if tag == "wipe" and renpy.store.vn_wipe:
-            wipe = renpy.store.vn_wipe
-            if wipe.get("is_in") and not vn_anim_value(wipe)[1]:
-                renpy.store.vn_wipe = None
 
     def vn_wait_time(seconds):
         """[wt N]: an un-skippable timed wait (ProcessScript 'wait time' has no tap test)."""
@@ -1044,143 +1038,7 @@ init -40 python:
         renpy.store.vn_mask = anim
         vn_mark_busy("mask", duration)
 
-    def vn_start_wipe(is_in, duration):
-        """Cover/reveal the stage while script state changes behind a wipe."""
-        duration = max(0.0, vn_float(duration, 0.0))
-        # Wipe volume is the covered portion: out fills it, in empties it.
-        renpy.store.vn_wipe = vn_anim(1.0, 0.0, duration) if is_in else vn_anim(0.0, 1.0, duration)
-        renpy.store.vn_wipe["is_in"] = is_in
-        vn_mark_busy("wipe", duration)
-
-    VN_WIPE_STRIP_COUNT = 8
-
-    def vn_wipe_direction(effect):
-        """Return (axis, reverse) for a directional or strip wipe effect name."""
-        e = (effect or "").lower()
-        if "lefttoright" in e or e == "rollleft":
-            return ("h", False)
-        if "righttoleft" in e or e == "rollright":
-            return ("h", True)
-        if "uptodown" in e:
-            return ("v", False)
-        if "downtoup" in e:
-            return ("v", True)
-        return (None, False)
-
-    def vn_wipe_is_strip(effect):
-        return "strip" in (effect or "").lower()
-
-    def vn_wipe_is_cinema(effect):
-        return "cinema" in (effect or "").lower()
-
-    VN_CINEMA_BAR_RATIO = 0.12
-
-    def vn_cinema_bar_transform(top=True):
-        """Transform for one cinema letterbox bar (top or bottom)."""
-        def fn(trans, st, at):
-            wipe = renpy.store.vn_wipe
-            if not wipe:
-                trans.alpha = 0.0
-                return None
-            progress, running = vn_anim_value(wipe)
-            progress = max(0.0, min(1.0, float(progress)))
-            if progress <= 0.0:
-                trans.alpha = 0.0
-                return 0 if running else None
-            bar_h = max(1, int(round(VN_CINEMA_BAR_RATIO * config.screen_height * progress)))
-            trans.alpha = 1.0
-            trans.xpos = 0
-            trans.xsize = config.screen_width
-            trans.ysize = bar_h
-            if top:
-                trans.ypos = 0
-            else:
-                trans.ypos = config.screen_height - bar_h
-            is_filter = wipe.get("filter", False)
-            if is_filter and progress >= 1.0 and not running:
-                return None
-            return 0 if running else None
-        return Transform(function=fn)
-
-    def vn_wipe_transform(strip_idx=0, strip_total=1):
-        """Transform for a single wipe strip/rect. Reads vn_wipe for progress and effect name."""
-        def fn(trans, st, at):
-            wipe = renpy.store.vn_wipe
-            if not wipe:
-                trans.alpha = 0.0
-                return None
-            progress, running = vn_anim_value(wipe)
-            progress = max(0.0, min(1.0, float(progress)))
-            effect = wipe.get("effect", "")
-            is_filter = wipe.get("filter", False)
-            axis, reverse = vn_wipe_direction(effect)
-            is_strip = vn_wipe_is_strip(effect)
-
-            if axis and not is_strip:
-                trans.alpha = 1.0 if progress > 0.0 else 0.0
-                w = config.screen_width
-                h = config.screen_height
-                if axis == "h":
-                    crop_w = int(round(progress * w))
-                    if reverse:
-                        trans.xpos = w - crop_w
-                    else:
-                        trans.xpos = 0
-                    trans.ypos = 0
-                    trans.xsize = max(1, crop_w)
-                    trans.ysize = h
-                else:
-                    crop_h = int(round(progress * h))
-                    if reverse:
-                        trans.ypos = h - crop_h
-                    else:
-                        trans.ypos = 0
-                    trans.xpos = 0
-                    trans.xsize = w
-                    trans.ysize = max(1, crop_h)
-                return 0 if running else None
-
-            if axis and is_strip:
-                w = config.screen_width
-                h = config.screen_height
-                cascade_offset = 0.3
-                local_start = strip_idx * cascade_offset / strip_total
-                local_end = local_start + (1.0 - cascade_offset)
-                local_progress = max(0.0, min(1.0, (progress - local_start) / max(0.001, local_end - local_start)))
-                trans.alpha = 1.0 if local_progress > 0.0 else 0.0
-                if axis == "h":
-                    strip_h = h // strip_total
-                    sy = strip_idx * strip_h
-                    strip_w = int(round(local_progress * w))
-                    if reverse:
-                        trans.xpos = w - strip_w
-                    else:
-                        trans.xpos = 0
-                    trans.ypos = sy
-                    trans.xsize = max(1, strip_w)
-                    trans.ysize = strip_h + (1 if strip_idx < strip_total - 1 else 0)
-                else:
-                    strip_w = w // strip_total
-                    sx = strip_idx * strip_w
-                    strip_h = int(round(local_progress * h))
-                    if reverse:
-                        trans.ypos = h - strip_h
-                    else:
-                        trans.ypos = 0
-                    trans.xpos = sx
-                    trans.xsize = strip_w + (1 if strip_idx < strip_total - 1 else 0)
-                    trans.ysize = max(1, strip_h)
-                return 0 if running else None
-
-            trans.alpha = progress
-            trans.xpos = 0
-            trans.ypos = 0
-            trans.xsize = config.screen_width
-            trans.ysize = config.screen_height
-            if is_filter and progress >= 1.0 and not running:
-                return None
-            return 0 if running else None
-        return Transform(function=fn)
+    # Wipes ([wipein]/[wipeout]/[wipeFilter]/[wipeOff]): vn_wipe.rpy.
 
     def vn_overlay_transform(key):
         def fn(trans, st, at):
@@ -1311,6 +1169,14 @@ init -40 python:
             return vn_flash_command(parts, blocking=False)
         if parts[0] == "cameraFilter":
             return vn_camera_filter_command(args)
+        import fgo_parser
+        if lname in fgo_parser.POSITIONED_CHARA_TAGS:
+            # Same handlers as the whole-line command; none of them block. A figure that starts fading in
+            # mid-line is not in the stage screen yet, so the screen is re-evaluated.
+            node = fgo_parser._parse_command_node(" ".join(parts))
+            done = bool(node) and apply_reader_node(node, get_api())
+            renpy.restart_interaction()
+            return done
         if lname == "messageshake":
             cycle = vn_float(args[0], 0.0) if len(args) >= 1 else 0.0
             ax = vn_float(args[1], 0.0) if len(args) >= 2 else 0.0
@@ -1440,15 +1306,62 @@ init -40 python:
             subs[gkey] = g
         return g
 
+    def vn_fs_command_offset_x(lname):
+        """ScriptManager.GetFSCommandOffsetX: +edge offset for the FSR/FSRNotNotch/FSSideR variants, - for the
+        L ones, 0 for the plain command (and on a 16:9 surface, where FSUtility.IsUnderVista holds)."""
+        l = lname.lower()
+        if l.endswith(("fssider", "fsr", "fsrnotnotch")):
+            return VN_FS_EDGE_OFFSET
+        if l.endswith(("fssidel", "fsl", "fslnotnotch")):
+            return -VN_FS_EDGE_OFFSET
+        return 0
+
+    # BattleScriptScene MargePanel/PictureFrame: an ExUISpriteRenderer widget, 627 high, pivot centre. Its anchors
+    # have no target, so NGUI never resizes it; a 16:9 screen shows the middle 576 rows. Its width is set by
+    # ScriptManager: PICTURE_FRAME_SPRITE_WIDTH_16_9 while CommonUI ForceObi_16_9 is on, the 21:9 width when a
+    # script contains [enableFullScreen] (EndFirstLoadAsset) or a frame asks for forceFullScreenSize.
+    VN_PICTURE_FRAME_HEIGHT = 627
+    VN_PICTURE_FRAME_WIDTH_16_9 = 1025
+    VN_PICTURE_FRAME_WIDTH_21_9 = 1346
+
+    def vn_picture_frame_script_width():
+        return VN_PICTURE_FRAME_WIDTH_21_9 if renpy.store.vn_script_full_screen else VN_PICTURE_FRAME_WIDTH_16_9
+
+    def vn_nodes_enable_full_screen(nodes):
+        """EndFirstLoadAsset: ForceObi_16_9 = !scriptData.Contains("[enableFullScreen]") (anywhere, branches too)."""
+        for node in nodes or []:
+            if node.get("name") == "enableFullScreen":
+                return True
+            if any(str(v).split()[:1] == ["enableFullScreen"] for v in (node.get("tags") or {}).values()):
+                return True
+            for choice in node.get("choices") or []:
+                if vn_nodes_enable_full_screen(choice.get("nodes")):
+                    return True
+        return False
+
+    # Custom/Sprite-ScriptActionPictureFrame (GLES3 vertex program): uv.y * 0.6113 + 0.3887, so only the top
+    # 61.13% of the texture is sampled (cut063_cinema: rows 0..626 of 1024) and stretched over the whole widget.
+    VN_PICTURE_FRAME_V_SPAN = 0.6113
+
+    def vn_picture_frame_crop(path):
+        try:
+            w, h = renpy.image_size(path)
+        except Exception:
+            return None
+        return (0, 0, w, int(round(h * VN_PICTURE_FRAME_V_SPAN)))
+
+    def vn_picture_frame_displayable(frame):
+        child = frame["path"]
+        if frame.get("crop"):
+            child = Crop(frame["crop"], child)
+        return Transform(child, xysize=(int(round(renpy.store.vn_pictureframe_width * upscale_ratio)),
+                                        int(round(VN_PICTURE_FRAME_HEIGHT * upscale_ratio))),
+                         xanchor=0.5, xpos=0.5, yanchor=0.5, ypos=0.5)
+
     def vn_group_fs_pos(lname, tok):
         """Parse an x,y position and add the FS/FSSide horizontal edge offset (0 on a 16:9 surface)."""
         x, y = vn_parse_position(tok, (0.0, 0.0))
-        l = lname.lower()
-        if l.endswith("fssider") or l.endswith("fsr"):
-            x += VN_FS_EDGE_OFFSET
-        elif l.endswith("fssidel") or l.endswith("fsl"):
-            x -= VN_FS_EDGE_OFFSET
-        return (x, y)
+        return (x + vn_fs_command_offset_x(lname), y)
 
     def vn_group_members(gkey):
         defs = renpy.store.current_chara_defs
@@ -2004,7 +1917,11 @@ init -40 python:
         if node_type == "metadata" and node.get("inline_cmds"):
             # A tag-only line ([image x][messageShake ...][se y]) has no text to type, so it runs now.
             for _, token in node["inline_cmds"]:
-                vn_msg_shake_command(token)
+                parts = token.split()
+                if parts[0].lower() == "wt":
+                    vn_execute_command({"name": "wt", "args": parts[1:]}, api)   # in order, a plain wait
+                else:
+                    vn_msg_shake_command(token)
             return True
 
         return False
@@ -2132,19 +2049,16 @@ init -40 python:
             vn_start_mask(args[0] if args else "black", False, args[1] if len(args) >= 2 else VN_DEFAULT_FADE_TIME)
             return True
         if lname in ("wipeout", "wipein"):
-            # Grammar: wipe{out,in} EFFECT TIME [PARAM]. Keep the effect name
-            # for diagnostics even though the port currently uses an opaque cover.
-            duration = args[1] if len(args) >= 2 else VN_DEFAULT_FADE_TIME
-            vn_start_wipe(lname == "wipein", duration)
-            if renpy.store.vn_wipe is not None:
-                renpy.store.vn_wipe["effect"] = args[0] if args else ""
-                renpy.store.vn_wipe["raw_args"] = list(args)
-            return True
+            return vn_wipe_command(lname, args)        # vn_wipe.rpy
         if lname in VN_ROLL_COMMANDS:
             return vn_chara_roll_command(lname, args, defs)
-        if lname == "charaput" and len(args) >= 2 and args[0] in defs:
+        if lname in VN_CHARA_PUT_COMMANDS and len(args) >= 2 and args[0] in defs:
+            # charaPut{,FSL,FSR,FSLNotNotch,FSRNotNotch,FSSideL,FSSideR} share one ScriptCommandExecute case:
+            # 'x,y' or a slot index, plus GetFSCommandOffsetX(tag, "charaPut") on x, then
+            # ScriptCharaData.SetPosition. The FS offset is 0 on a 16:9 surface.
             data = defs[args[0]]
-            data["pos"] = vn_parse_position(args[1], data.get("pos", (0.0, 0.0)))
+            x, y = vn_parse_position(args[1], data.get("pos", (0.0, 0.0)))
+            data["pos"] = (x + vn_fs_command_offset_x(lname), y)
             data["pos_anim"] = None
             # Alpha is intentionally untouched: charaPut is instant repositioning.
             # Characters not yet shown (via charaFadein / charaSpecialEffect) stay
@@ -2402,38 +2316,34 @@ init -40 python:
         if lname in ("messageshake", "messageshakestop"):
             return vn_msg_shake_command([name] + args)
 
-        if lname == "pictureframe" or lname == "pictureframetop":
-            name = args[0] if args else ""
-            if name:
-                path = api.get_script_image_path(name)
-                if path:
-                    path = path.replace("\\", "/")
-                    if lname == "pictureframetop":
-                        renpy.store.vn_pictureframe_top = {"path": path}
-                    else:
-                        renpy.store.vn_pictureframe = {"path": path, "name": name}
-                    return True
-            if lname == "pictureframetop":
-                renpy.store.vn_pictureframe_top = None
+        if name in ("pictureFrame", "pictureFrameTop"):
+            # One ScriptCommandExecute case. With ForceObi_16_9 (no [enableFullScreen] in the script) a
+            # forceFullScreenSize token widens the sprite to the 21:9 width once (isPictureFrameForceChangeSize).
+            # No name: undo that widening, then ClearPictureFrameImage. Else SetPictureFrameImage(name,
+            # isTop = "pictureFrameTop"): both load into the single PictureFrame sprite, isTop only moves it to
+            # PICTURE_FRAME_Z_POS_TOP, so the last one wins.
+            store = renpy.store
+            if (not store.vn_script_full_screen and "forceFullScreenSize" in args
+                    and not store.vn_pictureframe_force_size):
+                store.vn_pictureframe_width = VN_PICTURE_FRAME_WIDTH_21_9
+                store.vn_pictureframe_force_size = True
+            if not args:
+                if store.vn_pictureframe_force_size:
+                    store.vn_pictureframe_width = vn_picture_frame_script_width()
+                    store.vn_pictureframe_force_size = False
+                store.vn_pictureframe = None
+                return True
+            path = api.get_script_image_path(args[0])
+            if path:
+                path = path.replace("\\", "/")
+                store.vn_pictureframe = {"path": path, "name": args[0], "top": name == "pictureFrameTop",
+                                         "crop": vn_picture_frame_crop(path)}
             else:
-                renpy.store.vn_pictureframe = None
-            return True
-        if lname == "pictureframeoff":
-            renpy.store.vn_pictureframe = None
-            renpy.store.vn_pictureframe_top = None
+                store.vn_pictureframe = None     # the sprite is activated but its texture never arrives
             return True
 
-        if lname == "wipefilter":
-            duration = args[1] if len(args) >= 2 else VN_DEFAULT_FADE_TIME
-            vn_start_wipe(True, duration)
-            if renpy.store.vn_wipe is not None:
-                renpy.store.vn_wipe["effect"] = args[0] if args else ""
-                renpy.store.vn_wipe["raw_args"] = list(args)
-                renpy.store.vn_wipe["filter"] = True
-            return True
-        if lname == "wipeoff":
-            renpy.store.vn_wipe = None
-            return True
+        if lname in ("wipefilter", "wipeoff"):
+            return vn_wipe_command(lname, args)        # vn_wipe.rpy
 
         if lname in ("se", "seloop"):
             se = args[0] if args else None
@@ -2492,19 +2402,21 @@ init -40 python:
         # Not replicated (other effects, flow control): ignored.
         return False
 
-    VN_INLINE_COMMANDS = ("charaface", "charamove", "charamovereturn", "charamovereturnease", "charamoveease",
-                          "charamovescale", "charascale", "charaput", "charadepth", "cameramove", "cameramoveease",
-                          "charashake", "charashakestop") + VN_ROLL_COMMANDS
+    VN_CHARA_PUT_COMMANDS = ("charaput", "charaputfsl", "charaputfsr", "charaputfslnotnotch", "charaputfsrnotnotch",
+                             "charaputfssidel", "charaputfssider")
+
+    # Inline figure commands (fgo_parser.POSITIONED_CHARA_TAGS: charaFace/charaPut*/charaFadein/charaMove ...) are
+    # positioned and run by vn_msg_shake_command as the typewriter reaches them. These still run at line start.
+    VN_INLINE_COMMANDS = ("cameramove", "cameramoveease") + VN_ROLL_COMMANDS
 
     def vn_apply_inline_tags(node, api):
-        """Commands embedded in a message line ([charaFace X N], [charaMoveReturn S 0,10 0.2], ...) are run when
-        the line starts. FGO runs them when the typewriter reaches them; the parser drops that position."""
+        """Unpositioned commands embedded in a message line ([cameraMove ...], [charaRollMove ...], subRender*)
+        are run when the line starts. FGO runs them when the typewriter reaches them; the parser drops that
+        position for these."""
         for key, token in (node.get("tags") or {}).items():
             parts = str(token or key).split()
             if not parts:
                 continue
             name = parts[0]
-            if name.lower() == "charaface" and len(parts) >= 3 and parts[1] in renpy.store.current_chara_defs:
-                renpy.store.current_chara_defs[parts[1]]["face"] = parts[2]
-            elif name.lower() in VN_INLINE_COMMANDS or name.lower().startswith(("subrender", "subcamera", "subblur", "substretch")):
+            if name.lower() in VN_INLINE_COMMANDS or name.lower().startswith(("subrender", "subcamera", "subblur", "substretch")):
                 vn_execute_command({"name": name, "args": parts[1:]}, api)

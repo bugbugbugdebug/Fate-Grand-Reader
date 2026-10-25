@@ -105,41 +105,27 @@ screen vn_fade_layer():
     if vn_fade:
         add Solid(vn_overlay_color("vn_fade")) at vn_overlay_transform("vn_fade")
 
-# pictureFrame: full-screen image overlay behind the message window (cinema bars, decorative frames).
+# pictureFrame / pictureFrameTop share FGO's single PictureFrame sprite (vn_picture_frame_displayable). MargePanel
+# z (lower draws on top): stage 0 > pictureFrame -10 > FlashMesh -200 > wipes -210 > FadeMesh -220 >
+# pictureFrameTop -230; the message window and the menu are on other cameras, above all of it.
+# (The wipe material is queue 3001, so it draws over FadeMesh/FlashMesh/PictureFrame, all queue 3000, whatever their z.)
 screen vn_pictureframe_layer():
     zorder 45
-    if vn_pictureframe:
-        if vn_pictureframe.get("name") == "cut063_cinema":
-            # The 1024x1024 source packs two 92px black strips at y=0 and y=534.
-            # Stretching the whole texture puts the second strip across the scene.
-            $ _cinema_bar_h = int(round(config.screen_height * 92.0 / 1024.0))
-            add Solid("#000000") xysize (config.screen_width, _cinema_bar_h) ypos 0
-            add Solid("#000000") xysize (config.screen_width, _cinema_bar_h) ypos (config.screen_height - _cinema_bar_h)
-        else:
-            add vn_pictureframe["path"] xysize (config.screen_width, config.screen_height)
+    if vn_pictureframe and not vn_pictureframe.get("top"):
+        add vn_picture_frame_displayable(vn_pictureframe)
 
-# pictureFrameTop: full-screen image overlay above the message window (text overlays, top frames).
+# Over vn_fade_layer (50) and vn_wipe_layer (60), under reader_advance (80), vn_message (90) and reader_nav (100).
 screen vn_pictureframe_top_layer():
-    zorder 195
-    if vn_pictureframe_top:
-        add vn_pictureframe_top["path"] xysize (config.screen_width, config.screen_height)
+    zorder 65
+    if vn_pictureframe and vn_pictureframe.get("top"):
+        add vn_picture_frame_displayable(vn_pictureframe)
 
 # Wipes cover stage mutations (character moves/depth changes) and sit below the message UI.
+# VNWipeMesh (vn_wipe.rpy) draws FGO's WipeMesh with the decoded Wipe/<NAME> mask.
 screen vn_wipe_layer():
     zorder 60
     if vn_wipe:
-        $ _wipe_effect = (vn_wipe or {}).get("effect", "")
-        if vn_wipe_is_cinema(_wipe_effect):
-            add Solid("#000000") at vn_cinema_bar_transform(True)
-            add Solid("#000000") at vn_cinema_bar_transform(False)
-        else:
-            $ _wipe_axis, _wipe_rev = vn_wipe_direction(_wipe_effect)
-            $ _wipe_strip = vn_wipe_is_strip(_wipe_effect)
-            if _wipe_axis and _wipe_strip:
-                for _si in range(VN_WIPE_STRIP_COUNT):
-                    add Solid("#000000") at vn_wipe_transform(_si, VN_WIPE_STRIP_COUNT)
-            else:
-                add Solid("#000000") at vn_wipe_transform()
+        add vn_wipe["disp"]
 
 # CommonUI mask ([maskin]): above everything, including the message window.
 screen vn_mask_layer():

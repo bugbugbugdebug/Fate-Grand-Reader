@@ -185,10 +185,13 @@ init -30 python:
         fast-forward flag) lives in the store and is written only by VNAdvance, so a duplicated render of
         this displayable behaves identically to the real one."""
 
-        def __init__(self, child, steps, roll_t, clock="st", top=0, base=0, gated=False, **properties):
+        def __init__(self, child, steps, roll_t, clock="st", top=0, base=0, gated=False, pauses=(), **properties):
             super(VNTextBody, self).__init__(**properties)
             self.add(child)
             self.steps = list(steps)
+            # Mid-line [wt] holds (vn_split_inline_waits): steps and gates are in elapsed time, the
+            # typewriter child gets vn_text_time of it.
+            self.pauses = list(pauses)
             self.roll_t = float(roll_t)
             self.clock = clock
             self.top = int(top)
@@ -233,13 +236,17 @@ init -30 python:
                 offset, running, done = self._offset_at(0.0)
             elif self.gated and not renpy.store.vn_auto_mode:
                 eff, holding = vn_gate_eff_and_hold(self.steps)
-                child_st = eff
+                child_st = vn_text_time(eff, self.pauses)
                 offset, running, done = self._offset_at(eff)
-                running = running and not holding
+                running = (running and not holding) or (bool(self.pauses) and eff < self.pauses[-1][1])
             else:
                 base_t = st if self.clock == "st" else (vn_now() - self.t0)
-                child_st = base_t
+                if self.pauses:
+                    # Wall clock, so a tap can seek to the next [wt] (vn_msg_seek).
+                    base_t = vn_now() - float(renpy.store.vn_msg_start_wall)
+                child_st = vn_text_time(base_t, self.pauses)
                 offset, running, done = self._offset_at(base_t)
+                running = running or (bool(self.pauses) and base_t < self.pauses[-1][1])
 
             cr = renpy.render(self.child, width, height, child_st, at)
             # Lines whose roll has finished are dropped entirely (their descenders would otherwise peek
@@ -280,6 +287,67 @@ init -30 python:
         timed.sort(key=lambda e: e[0])
         return timed
 
+    def vn_inline_wt_seconds(token):
+        """A mid-line [wt N] becomes [wait time N] on a message line: waitCount drops by delta * GetTextSpeed
+        (max(speed, ScenarioTextSpeedLow) / ScenarioTextSpeedDefault), so it lasts N at the default speed.
+        At the top text speed the wait is zeroed."""
+        parts = token.split()
+        secs = max(0.0, vn_float(parts[1], 0.0)) if len(parts) >= 2 else 0.0
+        speed = vn_text_speed_setting()
+        if vn_text_cps() <= 0 or speed >= 5.0:
+            return 0.0
+        return secs / (speed / 3.0)
+
+    def vn_split_inline_waits(timed):
+        """Splits typewriter-timed inline tokens into commands and mid-line [wt] pauses. Returns
+        ([[elapsed_time, token], ...], [(pause_start, pause_end, text_time), ...]) where elapsed time counts
+        the pauses before each entry; a command written before a [wt] runs before it, one after runs after."""
+        commands = []
+        pauses = []
+        held = 0.0
+        for t, token in timed:
+            if token.split()[0].lower() == "wt":
+                d = vn_inline_wt_seconds(token)
+                if d > 0.0:
+                    pauses.append((t + held, t + held + d, t))
+                    held += d
+            else:
+                commands.append([t + held, token])
+        return commands, pauses
+
+    def vn_text_time(elapsed, pauses):
+        """Typewriter time after `elapsed` seconds of the message: the clock stands still inside a pause."""
+        t = elapsed
+        for start, end, text_t in pauses:
+            if elapsed < start:
+                break
+            if elapsed < end:
+                # Ren'Py shows the next glyph at exactly text_t, so hold just short of it.
+                return text_t - 0.001
+            t -= end - start
+        return t
+
+    def vn_elapsed_time(text_t, pauses):
+        """Inverse of vn_text_time for a line start: a pause at or before `text_t` delays it."""
+        return text_t + sum(end - start for start, end, t in pauses if t <= text_t)
+
+    def vn_msg_pause_at(eff):
+        """(inside a pause, start of the next pause or None) for the current message at elapsed time eff."""
+        for start, end, _ in renpy.store.vn_msg_pauses or []:
+            if start <= eff < end:
+                return True, None
+            if eff < start:
+                return False, start
+        return False, None
+
+    def vn_msg_seek(eff, steps):
+        """Moves the current message's elapsed-time anchor so its clock reads `eff` now."""
+        released = int(renpy.store.vn_msg_gates_released)
+        if released <= 0:
+            renpy.store.vn_msg_start_wall = vn_now() - eff
+        else:
+            renpy.store.vn_msg_last_release_wall = vn_now() - (eff - steps[released - 1][0])
+
     def vn_build_message_disp(text, inline=None):
         leading = vn_ensure_metrics()
         cps = vn_text_cps()
@@ -295,24 +363,27 @@ init -30 python:
         # (0.3 s EaseInOut) so the newest line sits at the bottom.
         pitch = vn_line_pitch()
         roll_t = vn_scroll_time()
+        # Inline [messageShake]s fire as the typewriter reaches them (vn_msg_shake_promote, driven by the
+        # vn_message shake transform); mid-line [wt]s hold the typewriter, so everything after them is later.
+        commands, pauses = vn_split_inline_waits(vn_inline_command_times(text, inline, cps))
         schedule = []
         for i in range(VN_VISIBLE_LINES, len(lines)):
             start = lines[i - 1][2] if cps > 0 else 0.0
-            schedule.append((start, pitch))
+            schedule.append((vn_elapsed_time(start, pauses), pitch))
 
         renpy.store.vn_msg_forced = False
         renpy.store.vn_msg_gates_released = 0
         renpy.store.vn_msg_start_wall = vn_now()
         renpy.store.vn_msg_last_release_wall = vn_now()
-        # Inline [messageShake]s fire as the typewriter reaches them (vn_msg_shake_promote, driven by the
-        # vn_message shake transform).
-        renpy.store.vn_msg_shake_pending = vn_inline_command_times(text, inline, cps)
+        renpy.store.vn_msg_shake_pending = commands
+        renpy.store.vn_msg_pauses = pauses
         # Final scroll once every line has rolled up: where the roll-out for the next same-speaker line
         # must begin so it continues from the on-screen position instead of jumping to the top.
         renpy.store.vn_msg_scroll = int(round(sum(dy for _, dy in schedule)))
         # Manual scroll only kicks in when there is something to scroll and AUTO mode is off.
         gated = bool(renpy.store.vn_require_input) and not renpy.store.vn_auto_mode and len(schedule) > 0
-        body = VNTextBody(text_disp, schedule, roll_t, clock="st", top=vn_text_top_offset(), gated=gated)
+        body = VNTextBody(text_disp, schedule, roll_t, clock="st", top=vn_text_top_offset(), gated=gated,
+                          pauses=pauses)
         renpy.store.vn_msg_body = body
         return renpy.display.layout.AdjustTimes(body, None, None)
 
@@ -323,6 +394,7 @@ init -30 python:
         renpy.store.vn_msg_visible = False
         renpy.store.vn_msg_disp = None
         renpy.store.vn_msg_body = None
+        renpy.store.vn_msg_pauses = []
         renpy.store.vn_msg_text = ""
         renpy.store.vn_msg_speaker = ""
         renpy.store.vn_msg_last_name = ""
@@ -424,10 +496,10 @@ init -30 python:
             # Text is still being revealed.
             body = renpy.store.vn_msg_body
             gated = body is not None and body.gated and not renpy.store.vn_auto_mode
+            steps = body.steps if body is not None else []
+            released = int(renpy.store.vn_msg_gates_released)
             if gated:
-                steps = body.steps
-                released = int(renpy.store.vn_msg_gates_released)
-                _, holding = vn_gate_eff_and_hold(steps)
+                eff, holding = vn_gate_eff_and_hold(steps)
                 if holding:
                     # Frozen at the bottom of the visible window: release one roll and resume typing
                     # from that boundary.
@@ -435,15 +507,26 @@ init -30 python:
                     renpy.store.vn_msg_last_release_wall = vn_now()
                     renpy.restart_interaction()
                     return None
-                if released < len(steps):
+            else:
+                eff = vn_now() - float(renpy.store.vn_msg_start_wall)
+
+            # A mid-line [wt] is [wait time] (not skippableTime): a tap never shortens it, and a tap while
+            # typing toward one only fills the text up to it.
+            in_pause, next_pause = vn_msg_pause_at(eff)
+            if in_pause:
+                return None
+            gate = steps[released][0] if gated and released < len(steps) else None
+            if next_pause is not None and (gate is None or next_pause < gate):
+                vn_msg_seek(next_pause, steps)
+                renpy.restart_interaction()
+                return None
+
+            if gated:
+                if gate is not None:
                     # Still typing toward a gate: fast-forward to fill the visible window, then hold there
                     # (do NOT auto-advance to the next line). Rewind the relevant time anchor so the pure
                     # eff computation lands exactly on the gate and stays clamped.
-                    gate = steps[released][0]
-                    if released <= 0:
-                        renpy.store.vn_msg_start_wall = vn_now() - gate
-                    else:
-                        renpy.store.vn_msg_last_release_wall = vn_now() - (gate - steps[released - 1][0])
+                    vn_msg_seek(gate, steps)
                     renpy.restart_interaction()
                     return None
                 # No gate left: reveal the rest of the (last) line at once.
@@ -467,9 +550,12 @@ init -30 python:
         vn_apply_inline_tags(node, api)
         record_dialogue(speaker, text)
         vn_show_message(speaker, node.get("speaker_slot"), text, node.get("inline_cmds"))
+        # Commands before the first character ([charaFace A 3]Hello) apply before the line is first drawn.
+        vn_msg_shake_promote()
         if vn_skipping():
             # Skip mode: complete text instantly and advance after a brief display pause
             vn_complete_message()
+            vn_msg_shake_promote(flush=True)
             if renpy.store.vn_text_done_at is None:
                 renpy.store.vn_text_done_at = vn_now()
             renpy.pause(0.02, hard=True)
@@ -477,6 +563,8 @@ init -30 python:
         renpy.store.vn_show_next_mark = True
         renpy.store.vn_auto_voice_hold = False
         renpy.call_screen("reader_advance")
+        # The line's remaining inline commands have all run before the next script command does.
+        vn_msg_shake_promote(flush=True)
         renpy.store.vn_show_next_mark = False
         renpy.store.vn_auto_voice_hold = False
         # The [k] touch wait ends: if isBusyVoice, stopVoiceAll(0) (a voice never outlives its line).
@@ -532,7 +620,6 @@ init -30 python:
         renpy.store.vn_msg_shake = None          # ProcessScript/ExitExecuteScript: messageManager.Shake(0,0,0,0)
         renpy.store.vn_msg_shake_pending = []
         renpy.store.vn_pictureframe = None
-        renpy.store.vn_pictureframe_top = None
         renpy.store.vn_sublayers = {}
         renpy.store.vn_substretch_enabled = True
         renpy.store.vn_skip_allowed = True
@@ -546,9 +633,13 @@ init -30 python:
         vn_voice_stop()
         vn_message_off()
 
-    def vn_begin_phase():
+    def vn_begin_phase(nodes=None):
         """Each script starts behind the black mask (ScriptManager DEFAULT_FADE_TIME); the script's own
         [fadein] reveals the stage."""
         vn_reset_stage()
+        # EndFirstLoadAsset sizes the PictureFrame for this script (isPictureFrameForceChangeSize is static and
+        # is not reset here).
+        renpy.store.vn_script_full_screen = vn_nodes_enable_full_screen(nodes)
+        renpy.store.vn_pictureframe_width = vn_picture_frame_script_width()
         renpy.store.vn_fade = {"from": 1.0, "to": 1.0, "start": vn_now(), "dur": 0.0, "color": "#000000"}
         renpy.store.vn_phase_fade_seen = False

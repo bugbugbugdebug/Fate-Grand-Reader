@@ -65,6 +65,15 @@ POSITIONED_TAGS = {"messageshake", "messageshakestop", "voice", "voicestop", "fl
 POSITIONED_TAGS.update(anchor + op
                        for anchor in ("effect", "backeffect", "charaeffect", "charabackeffect", "fowardeffect", "forwardeffect")
                        for op in ("", "pause", "start", "stop", "destroy", "forcestop"))
+# Figure commands typed mid-line ("...THAT guy.[charaFadeout L 0.4][charaPutFSR N 300,0][charaFadeTime N 0.4 0.7]")
+# also run in order as the typewriter reaches them, so a swap at the end of a line happens at the end.
+POSITIONED_CHARA_TAGS = {"charaput", "charaputfsl", "charaputfsr", "charaputfslnotnotch", "charaputfsrnotnotch",
+                         "charaputfssidel", "charaputfssider", "charafadein", "charafadeout", "charafadetime",
+                         "charaface", "charamove", "charamovereturn", "charamovereturnease", "charamoveease",
+                         "charamovescale", "charascale", "charadepth", "charashake", "charashakestop"}
+POSITIONED_TAGS.update(POSITIONED_CHARA_TAGS)
+# A mid-line [wt N] holds the typewriter at its position ("that little guy...[wt 0.5]goes on to").
+POSITIONED_TAGS.add("wt")
 _POSITION_MARK = ""
 
 

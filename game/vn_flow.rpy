@@ -460,6 +460,8 @@ label play_war:
             while phase_idx < len(quest["phase_scripts"]):
                 $ phase_script = quest["phase_scripts"][phase_idx]
                 $ current_reader_marker = {"war_id": selected_war_id, "quest_idx": quest_idx, "phase_idx": phase_idx, "script_id": phase_script.get("scriptId"), "script": phase_script.get("script")}
+                # The MENU's backlog covers only the section being read.
+                $ backlog = []
                 show screen loading_screen("Loading phase [phase_script.get('phase')]...")
                 $ renpy.pause(0.1, hard=True)
                 python:
@@ -470,7 +472,7 @@ label play_war:
                     $ war_load_error = api.last_error or "Failed to load a phase script."
                     call screen message_screen(war_load_error)
                 else:
-                    $ vn_begin_phase()
+                    $ vn_begin_phase(phase_nodes)
                     $ vn_play_nodes(phase_nodes, api)
                     $ vn_message_off()
 
@@ -511,7 +513,7 @@ label play_war:
         hide screen vn_stage
         jump start
 
-    $ vn_begin_phase()
+    $ vn_begin_phase(active_war["script_nodes"])
     $ vn_play_nodes(active_war["script_nodes"], api)
     $ vn_message_off()
 
