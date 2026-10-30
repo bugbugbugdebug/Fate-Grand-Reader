@@ -257,6 +257,99 @@ init 10 python:
         vn_fx_prune()
         return True
 
+    # Off-screen cull. Unity never draws an off-screen rig, but here every live particle costs
+    # Python each 1/30 s frame, and scripts park rigs off-screen with a looping effect still on
+    # them (charaPut R 2000,2000, often with a misspelled charaEffectDestroy that FGO ignores too).
+    # A looping effect in its steady state (vn_fx_cull_steady) is skipped only when its root lies
+    # outside the camera view plus a half-canvas margin AND everything it drew over at least one
+    # particle life of full frames (VN_FX_CULL_WATCH at most), taken relative to the root, did too
+    # (a frame that drew nothing never culls). A rig or camera change draws it again at once and
+    # restarts the watch. Each skip lasts half the time the drawn box's fastest edge (measured
+    # between two full frames) needs to reach the view, at most VN_FX_CULL_RECHECK seconds.
+    # The particle clock is wall time, so skipped frames change nothing that is drawn later.
+    # Validated by a sweep of all 895 effects parked just past each edge of the view.
+    VN_FX_CULL_RECHECK = 2.0
+    VN_FX_CULL_WATCH = 3.0
+
+    def vn_fx_draw_box(r):
+        """Conservative (x0, y0, x1, y1) of everything a Render tree draws, in its own coordinates
+        (a child blitted at o draws its point p at o + r.reverse * p). None = unknown, assume visible;
+        an empty tree gives an empty box (inf, inf, -inf, -inf)."""
+        if not isinstance(r, renpy.display.render.Render):
+            size = getattr(r, "get_size", None)
+            if size is None:
+                return None
+            w, h = size()
+            return (0.0, 0.0, float(w), float(h))
+        M = r.reverse
+        if r.mesh:
+            # A mesh Render draws only its geometry; its children are the textures it samples.
+            if r.mesh is True:
+                pts = [(0.0, 0.0), (float(r.width), float(r.height))]
+            else:
+                # Mesh2 (big quads, clip polygons): its points, in the Render's coordinates.
+                get_points = getattr(r.mesh, "get_points", None)
+                raw = get_points() if get_points is not None else None
+                if not raw or any(p[3] <= 0.0 for p in raw):
+                    return None
+                pts = [(p[0] / p[3], p[1] / p[3]) for p in raw]
+            x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
+            x1, y1 = max(p[0] for p in pts), max(p[1] for p in pts)
+            if M is not None:
+                pts = [M.transform(px, py) for px, py in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+                x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
+                x1, y1 = max(p[0] for p in pts), max(p[1] for p in pts)
+            return (x0, y0, x1, y1)
+        # A plain container draws only its children, never its own (often canvas-sized) area.
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for child in r.children:
+            b = vn_fx_draw_box(child[0])
+            if b is None:
+                return None
+            if b[0] > b[2]:
+                continue
+            if M is not None:
+                pts = [M.transform(px, py) for px, py in ((b[0], b[1]), (b[2], b[1]), (b[0], b[3]), (b[2], b[3]))]
+                b = (min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
+            x0 = min(x0, b[0] + child[1])
+            y0 = min(y0, b[1] + child[2])
+            x1 = max(x1, b[2] + child[1])
+            y1 = max(y1, b[3] + child[2])
+        return (x0, y0, x1, y1)
+
+    def vn_fx_cull_steady(spec, rec, elapsed, max_life):
+        """Only a looping effect in its steady state may be culled: past its start clip plus one full
+        particle life, with no loop-clip or autoplay animation and no stop pending. Earlier, what a
+        frame draws does not bound later frames (intros that grow onto the screen, late flashes)."""
+        if not spec.get("loop") or rec["stop"] is not None or spec.get("autos"):
+            return False
+        clips = spec.get("clips") or {}
+        if clips.get("loop"):
+            return False
+        return elapsed > (clips.get("start") or 0.0) + max_life + 1.0
+
+    def vn_fx_view_rect(width, height):
+        """The canvas area the stage camera can show, widened by half a canvas; None = do not cull."""
+        cam = store.vn_camera
+        px = py = 0.0
+        zoom = 1.0
+        if cam:
+            pos = vn_anim_value(cam.get("pos_anim"))[0]
+            scale = vn_anim_value(cam.get("scale_anim"))[0]
+            if pos is not None:
+                px, py = float(pos[0]), float(pos[1])
+            if scale is not None:
+                zoom = float(scale)
+        if zoom <= 0.0:
+            return None
+        # Canvases are in native NGUI px (FGOFXCloud: up = width / native_width = 1).
+        hx = width * 0.5 / min(zoom, 1.0) + width * 0.5
+        hy = height * 0.5 / min(zoom, 1.0) + height * 0.5
+        cx = width * 0.5 + px
+        cy = height * 0.5 - py
+        return (cx - hx, cy - hy, cx + hx, cy + hy), (px, py, zoom)
+
     class VNConvertedEffect(FGOFXCloud):
         def __init__(self, rec):
             super(VNConvertedEffect, self).__init__(rec["name"], layer13=rec["anchor"] != "fowardeffect",
@@ -265,6 +358,9 @@ init 10 python:
             self.native_width = 1024.0
             self.root_matrix = VN_FX_IDENTITY
             self.birth_roots = {}
+            self.cull = None
+            self.cull_seen = None
+            self.cull_reach = None
 
         def render(self, width, height, st, at):
             rec = self.record
@@ -281,7 +377,64 @@ init 10 python:
             elapsed = vn_fx_elapsed(rec)
             cutoff = elapsed - self.max_life - 1.0
             self.birth_roots = {k: v for k, v in self.birth_roots.items() if k[1] >= cutoff}
-            return super(VNConvertedEffect, self).render(width, height, elapsed, at)
+            view = None
+            if vn_fx_cull_steady(self.spec, rec, elapsed, self.max_life) and (
+                    rec["slot"] is None or rec["owner"].get("sub_group") is None):
+                # Sub-camera groups draw into their own canvases; only the main stage is culled.
+                view = vn_fx_view_rect(width, height)
+            if view is not None:
+                (vx0, vy0, vx1, vy1), cam_key = view
+                rx, ry = width * 0.5 + x, height * 0.5 - y
+                if vx0 <= rx <= vx1 and vy0 <= ry <= vy1:
+                    view = None
+            if view is None:
+                self.cull = self.cull_seen = self.cull_reach = None
+                return super(VNConvertedEffect, self).render(width, height, elapsed, at)
+            key = (x, y, scale, R, rec["flip"], cam_key, width, height)
+            if self.cull is not None and self.cull[0] == key and elapsed < self.cull[1]:
+                renpy.redraw(self, 1.0 / 30.0)
+                return renpy.Render(width, height)
+            rv = super(VNConvertedEffect, self).render(width, height, elapsed, at)
+            self.cull = None
+            seen, self.cull_seen = self.cull_seen, None
+            box = None
+            for child in rv.children:
+                b = vn_fx_draw_box(child[0])
+                if b is None:
+                    return rv
+                if b[0] > b[2]:
+                    continue
+                b = (b[0] + child[1], b[1] + child[2], b[2] + child[1], b[3] + child[2])
+                box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]), max(box[2], b[2]), max(box[3], b[3]))
+            if box is None:
+                return rv
+            # Reach: everything drawn since the rig/camera last changed, relative to the root, so
+            # sporadic content (random bolts, bursts) counts once it has been seen.
+            rel = (box[0] - rx, box[1] - ry, box[2] - rx, box[3] - ry)
+            reach = self.cull_reach
+            if reach is None or reach[0] != key:
+                reach = (key, elapsed, rel)
+            else:
+                r_ = reach[2]
+                reach = (key, reach[1], (min(r_[0], rel[0]), min(r_[1], rel[1]), max(r_[2], rel[2]), max(r_[3], rel[3])))
+            self.cull_reach = reach
+            env = (reach[2][0] + rx, reach[2][1] + ry, reach[2][2] + rx, reach[2][3] + ry)
+            # Separation from the view along the best axis (> 0: off-screen).
+            gap = max(vx0 - env[2], env[0] - vx1, vy0 - env[3], env[1] - vy1)
+            if gap <= 0.0:
+                return rv
+            self.cull_seen = (key, elapsed, box)
+            # Watch one particle life (at most VN_FX_CULL_WATCH s) of full frames before skipping any.
+            if elapsed - reach[1] < min(self.max_life, VN_FX_CULL_WATCH):
+                renpy.redraw(self, 1.0 / 30.0)
+                return rv
+            if seen is not None and seen[0] == key and elapsed > seen[1]:
+                # Skip for half the time the fastest-moving box edge (since the previous full frame,
+                # at least 50 px/s) needs to cross the gap; the first off-screen frame only measures.
+                speed = max(50.0, max(abs(a - b) for a, b in zip(box, seen[2])) / (elapsed - seen[1]))
+                self.cull = (key, elapsed + min(VN_FX_CULL_RECHECK, 0.5 * gap / speed))
+            renpy.redraw(self, 1.0 / 30.0)
+            return rv
 
         def parent_particle(self, ei, e, birth, now):
             # World-space particles retain the root pose at birth. Cache on the displayable,

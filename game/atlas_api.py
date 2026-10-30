@@ -45,6 +45,8 @@ class AtlasAPI:
         # per-war chapter lists built off it. See get_war_list / get_war_chapters.
         self._war_list_cache = None
         self._chapter_cache = {}
+        # First-run war id -> its rerun wars (group_event_reruns), built off the same export.
+        self._rerun_cache = None
         # Offline mode: when True, only cached data loads and no network requests are made. Seeded from
         # config.json ("offline"); the reader's Settings toggle flips it live via get_api()/api.offline.
         self.offline = bool(AtlasAPI.config.get("offline", False))
@@ -159,6 +161,7 @@ class AtlasAPI:
             if force_refresh:
                 # A refreshed export can move quests about, and chapter indices are positional.
                 self._chapter_cache = {}
+                self._rerun_cache = None
         return data
 
     def get_bgm_index(self, force_refresh: bool = False):
@@ -400,6 +403,72 @@ class AtlasAPI:
             urls.extend(cls._quest_scripts(quest))
         return tuple(urls)
 
+    # A later event war is a rerun of an earlier story when at least this share of its readable
+    # scripts already belongs to that story. Revivals copy the story but add or drop a few scenes
+    # (SE.RA.PH 65 of 66, Garden of Order 16 of 17, Lady Reines adds a Plus Episode), so exact
+    # equality misses them; sequels that reuse a scene (Nero Fest 2019 1 of 4, Battle in New York
+    # 2021 3 of 11) stay separate events.
+    EVENT_RERUN_SHARE = 0.5
+
+    @classmethod
+    def group_event_reruns(cls, wars):
+        """Readable event wars grouped by story: a list of runs lists, each in (eventId, war id) order
+        so the first run comes first, and the groups themselves in first-run order."""
+        groups = []  # [runs, union of the runs' scripts]
+        for war in sorted((w for w in wars if cls.is_event_war(w)),
+                          key=lambda w: (w.get("eventId") or 0, w.get("id") or 0)):
+            scripts = set(cls.event_story_signature(war))
+            if not scripts:
+                continue
+            best, best_shared = None, 0
+            for group in groups:
+                shared = len(scripts & group[1])
+                if shared > best_shared:
+                    best, best_shared = group, shared
+            if best is not None and best_shared >= cls.EVENT_RERUN_SHARE * len(scripts):
+                best[0].append(war)
+                best[1].update(scripts)
+            else:
+                groups.append([[war], scripts])
+        return [runs for runs, _ in groups]
+
+    def get_event_reruns(self, war_id: int):
+        """The later runs of the event story that war `war_id` is the first run of, or []."""
+        if self._rerun_cache is None:
+            wars = self.get_war_list()
+            if not wars:
+                return []
+            self._rerun_cache = {runs[0].get("id"): runs[1:] for runs in self.group_event_reruns(wars)}
+        return self._rerun_cache.get(war_id, [])
+
+    def get_reader_quests(self, war_data: dict):
+        """get_story_quests, plus the chapters only a rerun has, appended in rerun order.
+
+        Only the first run of an event is listed, so a revival's extra chapters (Lady Reines's
+        "A Fictitious Return", the GUDAGUDA Imperial Capital revival's ten) live on here. A rerun
+        quest is skipped when its scripts are all already listed or the first run already has a
+        chapter of that name: revivals re-issue some chapters under new script ids (Chaldea Summer
+        Adventure's "Section 10", Garden of Order's "Ogawa-heim"). Appending keeps the first run's
+        own chapter indices, which resume markers and play_war use positionally.
+        """
+        quests = self.get_story_quests(war_data)
+        reruns = self.get_event_reruns(war_data.get("id")) if self.is_event_war(war_data) else []
+        if not reruns:
+            return quests
+        quests = list(quests)
+        names = {quest["name"] for quest in quests}
+        scripts = {ps["script"] for quest in quests for ps in quest["phase_scripts"]}
+        war_long_name = war_data.get("longName") or war_data.get("name") or ""
+        for rerun in reruns:
+            for quest in self.get_story_quests(rerun):
+                own = [ps["script"] for ps in quest["phase_scripts"]]
+                if quest["name"] in names or all(url in scripts for url in own):
+                    continue
+                names.add(quest["name"])
+                scripts.update(own)
+                quests.append(dict(quest, warLongName=war_long_name))
+        return quests
+
     def get_story_quests(self, war_data: dict):
         story_quests = []
         quest_types = self.story_quest_types(war_data)
@@ -532,7 +601,7 @@ class AtlasAPI:
         if war_data is None:
             return None
 
-        chapters = self.get_story_quests(war_data)
+        chapters = self.get_reader_quests(war_data)
         self._chapter_cache[war_id] = chapters
         return chapters
 
@@ -563,7 +632,7 @@ class AtlasAPI:
         raw_script_text = None
         script_id = war_data.get("scriptId")
         script_url = war_data.get("script")
-        story_quests = self.get_story_quests(war_data)
+        story_quests = self.get_reader_quests(war_data)
 
         if story_quests:
             self.last_error = ""

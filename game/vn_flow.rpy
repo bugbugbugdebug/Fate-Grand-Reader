@@ -126,22 +126,25 @@ init -10 python:
     VN_EVENTS_PART_TARGET = 5
 
     def vn_mark_event_rows(api, rows, export):
-        """Flag rows of readable event wars: row["event"] = rank by (eventId, war id), and row
-        ["eventName"]. Duplicate stories (revivals) keep only the earliest event."""
-        by_id = {item.get("id"): item for item in export}
-        seen = set()
+        """Flag rows of readable event wars: row["event"] = rank by (eventId, war id), row
+        ["eventName"] and row["bannerUrls"]. Reruns (AtlasAPI.group_event_reruns) keep only the
+        first run's row, but their banners follow it as fallbacks: many first runs have no banner
+        on Atlas's CDN while their revival does."""
+        by_id = {row["id"]: row for row in rows}
         rank = 0
-        for item in sorted((i for i in export if api.is_event_war(i)),
-                           key=lambda i: (i.get("eventId") or 0, i.get("id") or 0)):
-            signature = api.event_story_signature(item)
-            if not signature or signature in seen:
+        for runs in api.group_event_reruns(export):
+            row = by_id.get(runs[0].get("id"))
+            if row is None:
                 continue
-            seen.add(signature)
             rank += 1
-            for row in rows:
-                if row["id"] == item["id"]:
-                    row["event"] = rank
-                    row["eventName"] = (item.get("eventName") or "").strip()
+            row["event"] = rank
+            row["eventName"] = (runs[0].get("eventName") or "").strip()
+            urls = []
+            for war in runs:
+                url = war.get("banner") or ""
+                if url and url not in urls:
+                    urls.append(url)
+            row["bannerUrls"] = urls
         return rank
 
     def vn_event_rows():
@@ -156,8 +159,13 @@ init -10 python:
         """
         cache = get_api().cache
         for row in rows:
-            url = row.get("bannerUrl") or ""
-            row["banner"] = (cache.get_asset_path(url) or "").replace(chr(92), "/") if url else ""
+            row["banner"] = ""
+            # Event rows list their reruns' banners after their own; the first one cached wins.
+            for url in row.get("bannerUrls") or [row.get("bannerUrl") or ""]:
+                path = cache.get_asset_path(url) if url else None
+                if path:
+                    row["banner"] = path.replace(chr(92), "/")
+                    break
         return rows
 
     def vn_download_banners(rows):
@@ -170,13 +178,18 @@ init -10 python:
         api = get_api()
         fetched = 0
         for row in rows:
-            url = row.get("bannerUrl") or ""
-            if not url or not (vn_war_is_displayed(row.get("id")) or row.get("event")):
+            if not (vn_war_is_displayed(row.get("id")) or row.get("event")):
                 continue
-            if api.cache.get_asset_path(url):
-                continue
-            if api.get_banner_path(url):
-                fetched += 1
+            # In order, stopping at the first that exists: a rerun's banner is only fetched
+            # when the first run's 404s.
+            for url in row.get("bannerUrls") or [row.get("bannerUrl") or ""]:
+                if not url:
+                    continue
+                if api.cache.get_asset_path(url):
+                    break
+                if api.get_banner_path(url):
+                    fetched += 1
+                    break
         return fetched
 
     def vn_forget_war_list():
@@ -292,7 +305,8 @@ init -10 python:
 
 # Bumped when the saved war-list schema changes, so an older cache is rebuilt rather
 # than half-read. v2 stores bannerUrl and resolves the cached path on every load.
-define VN_WAR_LIST_CACHE_VERSION = 3
+# v4 groups event reruns and gives event rows bannerUrls (first run's, then reruns').
+define VN_WAR_LIST_CACHE_VERSION = 4
 
 label start:
     $ menu_notice = ""

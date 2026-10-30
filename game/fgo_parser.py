@@ -264,8 +264,9 @@ def _is_choice_start_marker(line: str) -> bool:
 
     Dialogue frequently consists of a bare ``?`` or ``???``. Treating every question-mark-prefixed
     line as a menu opener made the parser consume all content up to the next unrelated ``？！``.
+    The number may carry extra comma fields (``？1,5000：...``, used by ``[input selectBranch]`` menus).
     """
-    return bool(re.match(r"^[？?]\d+[：:]", line))
+    return bool(re.match(r"^[？?]\d+(?:[,，]\d+)*[：:]", line))
 
 
 def _collect_choice_branches(block_lines: list[str]) -> list[dict]:

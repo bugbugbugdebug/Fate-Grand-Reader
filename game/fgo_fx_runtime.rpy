@@ -126,10 +126,53 @@ init -5 python:
 
     fgo_fx_defs = {}
 
+    # (runtime_performance 2026-10-23) Performance only, the same numbers: Ren'Py compiles every
+    # list / dict / set literal, list(), dict(), range() and sorted() in .rpy code into its
+    # rollback-tracked Revertable* types, whose item access is a Python-level call and whose every
+    # append logs the object for rollback. The effect data and the render path need no rollback, so
+    # True = specs are stored as plain list / dict / set (fgo_fx_register, before anything keys on
+    # their id()) and the runtime's functions use the plain types (_fgo_fx_plain_patch at the end
+    # of this file); the public show / stop / hide API keeps Ren'Py's types. An OFF comparison sets
+    # it between this block and the specs' init -1 (an init -2 python block). [regress IDENTICAL, notes/runtime_performance.md]
+    _fgo_fx_plain = True
+
+    # the base of the runtime's helper classes: Ren'Py's store `object` logs every attribute write
+    # for rollback (RevertableObject); with _fgo_fx_plain the plain built-in (read at init 0)
+    _FGO_FX_OBJECT = object
+
+    def _fgo_fx_plain_data(x, memo):
+        """A deep copy of registered spec data with plain containers (shared objects stay shared)."""
+        t = type(x)
+        if t is int or t is float or t is str or t is bool or x is None:
+            return x
+        got = memo.get(id(x))
+        if got is not None:
+            return got
+        if isinstance(x, python_list):
+            rv = python_list()
+            memo[id(x)] = rv
+            rv.extend(_fgo_fx_plain_data(v, memo) for v in x)
+        elif isinstance(x, python_dict):
+            rv = python_dict()
+            memo[id(x)] = rv
+            for k, v in x.items():
+                rv[k] = _fgo_fx_plain_data(v, memo)
+        elif t is tuple:
+            rv = tuple(_fgo_fx_plain_data(v, memo) for v in x)
+            memo[id(x)] = rv
+        elif isinstance(x, (python_set, frozenset)):
+            rv = (python_set if isinstance(x, python_set) else frozenset)(x)
+            memo[id(x)] = rv
+        else:
+            return x
+        return rv
+
     # id() of every Birth sub-emitter parent (filled by fgo_fx_register; _fgo_fx_fclock_scope)
     _fgo_fx_sub_parents = set()
 
     def fgo_fx_register(name, spec):
+        if _fgo_fx_plain:
+            spec = _fgo_fx_plain_data(spec, {})
         fgo_fx_defs[name] = spec
         for e_ in spec["emitters"]:
             if "sub" in e_:
@@ -649,6 +692,9 @@ init -5 python:
         return round(done, 3)
 
 init python:
+
+    if _fgo_fx_plain:
+        _FGO_FX_OBJECT = python_object
 
     # Legacy Shaders/Particles/Alpha Blended: col = clamp(2 * vcol * _TintColor
     # * tex). u_fgo_mul carries 2*_TintColor*particle colour, which can exceed
@@ -3385,55 +3431,62 @@ init python:
             h = math.fmod(pre, 0.03)
             if h < 1e-7:
                 h = 0.03
-        pi_ = 0
-        age = 0.0
         speed_at = _fgo_fx_speed_at(e, life, smix) if "speedmod" in e else lambda age: 1.0
-        states = [(0.0, p[0], p[1], p[2])]
         pairs = {2: (0, 1), 0: (1, 2), 1: (2, 0)}
-        while age < life + DT:
-            u = min(1.0, age / life)
-            sm = speed_at(age)
-            v[0] += F_[0] * h
-            v[1] += (g + F_[1]) * h
-            v[2] += F_[2] * h
-            off = _fgo_fx_mv(M, [val(a, u, orbit_mix[4 + i])
-                                  for i, a in enumerate(ob.get("off", (None,) * 3))])
-            q = list(_fgo_fx_mv(MI, [p[i] - off[i] for i in range(3)]))
-            for ax in (2, 0, 1):
-                ang = val(ob["w"][ax], u, orbit_mix[ax]) * h * sm
-                if ang:
-                    c, s_ = math.cos(ang), math.sin(ang)
-                    i, j = pairs[ax]
-                    qi, qj = q[i], q[j]
-                    q[i], q[j] = c * qi - s_ * qj, s_ * qi + c * qj
-            r = val(ob["r"], u, orbit_mix[3]) * h * sm
-            if r:
-                n = math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2])
-                if n > 0.0:
-                    q = [x + x / n * r for x in q]
-            q = _fgo_fx_mv(M, q)
-            lv = lin(u)
-            if c2 is not None:
-                # Limit Velocity sees v + vol + the orbit chord
-                hs = h * sm
-                tx = v[0] + lv[0] + ((q[0] + off[0] - p[0]) / hs if hs else 0.0)
-                ty = v[1] + lv[1] + ((q[1] + off[1] - p[1]) / hs if hs else 0.0)
-                tz = v[2] + lv[2] + ((q[2] + off[2] - p[2]) / hs if hs else 0.0)
-                lim = _fgo_fx_limit_at(c2, c2m, age, life)
-                sp = math.sqrt(tx * tx + ty * ty + tz * tz)
-                if sp > lim:
-                    f = (sp - max(lim, 0.0)) / sp * (1.0 - (1.0 - c2["damp"]) ** (_FGO_FX_DAMPEN_HZ * h))
-                    v[0] -= tx * f
-                    v[1] -= ty * f
-                    v[2] -= tz * f
-            p = [q[i] + off[i] + (v[i] + lv[i]) * h * sm for i in range(3)]
-            age += h
-            states.append((age, p[0], p[1], p[2]))
-            if pws is not None:
-                pi_ += 1
-                h = pws[pi_] if pi_ < len(pws) else DT
-            else:
-                h = min(0.03, pre - age) if age < pre - 1e-7 else DT
+        first = (0.0, p[0], p[1], p[2])
+
+        def steps(p, v, h):
+            pi_ = 0
+            age = 0.0
+            while age < life + DT:
+                u = min(1.0, age / life)
+                sm = speed_at(age)
+                v[0] += F_[0] * h
+                v[1] += (g + F_[1]) * h
+                v[2] += F_[2] * h
+                off = _fgo_fx_mv(M, [val(a, u, orbit_mix[4 + i])
+                                      for i, a in enumerate(ob.get("off", (None,) * 3))])
+                q = list(_fgo_fx_mv(MI, [p[i] - off[i] for i in range(3)]))
+                for ax in (2, 0, 1):
+                    ang = val(ob["w"][ax], u, orbit_mix[ax]) * h * sm
+                    if ang:
+                        c, s_ = math.cos(ang), math.sin(ang)
+                        i, j = pairs[ax]
+                        qi, qj = q[i], q[j]
+                        q[i], q[j] = c * qi - s_ * qj, s_ * qi + c * qj
+                r = val(ob["r"], u, orbit_mix[3]) * h * sm
+                if r:
+                    n = math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2])
+                    if n > 0.0:
+                        q = [x + x / n * r for x in q]
+                q = _fgo_fx_mv(M, q)
+                lv = lin(u)
+                if c2 is not None:
+                    # Limit Velocity sees v + vol + the orbit chord
+                    hs = h * sm
+                    tx = v[0] + lv[0] + ((q[0] + off[0] - p[0]) / hs if hs else 0.0)
+                    ty = v[1] + lv[1] + ((q[1] + off[1] - p[1]) / hs if hs else 0.0)
+                    tz = v[2] + lv[2] + ((q[2] + off[2] - p[2]) / hs if hs else 0.0)
+                    lim = _fgo_fx_limit_at(c2, c2m, age, life)
+                    sp = math.sqrt(tx * tx + ty * ty + tz * tz)
+                    if sp > lim:
+                        f = (sp - max(lim, 0.0)) / sp * (1.0 - (1.0 - c2["damp"]) ** (_FGO_FX_DAMPEN_HZ * h))
+                        v[0] -= tx * f
+                        v[1] -= ty * f
+                        v[2] -= tz * f
+                p = [q[i] + off[i] + (v[i] + lv[i]) * h * sm for i in range(3)]
+                age += h
+                yield (age, p[0], p[1], p[2])
+                if pws is not None:
+                    pi_ += 1
+                    h = pws[pi_] if pi_ < len(pws) else DT
+                else:
+                    h = min(0.03, pre - age) if age < pre - 1e-7 else DT
+
+        if _fgo_fx_lazy_orbit:
+            return _FGOFXOrbitTrack(first, steps(p, v, h), life, p0)
+        states = [first]
+        states.extend(steps(p, v, h))
         out = []
         j = 0
         n = int(life / _FGO_FX_CLAMP_DT) + 2
@@ -4088,7 +4141,7 @@ init python:
         vx, vy, vz = _fgo_fx_sing_map(K, vx, vy, vz)
         return (x, y, vx, vy, vz, z)
 
-    class _FGOFXSingTrack(object):
+    class _FGOFXSingTrack(_FGO_FX_OBJECT):
         """_fgo_fx_sing_track over a lazy track: mapped on access."""
 
         def __init__(self, K, track):
@@ -4176,7 +4229,8 @@ init python:
             s0, s1 = states[j], states[j + 1]
             f = (a - s0[0]) / (s1[0] - s0[0]) if s1[0] > s0[0] else 0.0
             f = min(1.0, max(0.0, f))
-            out.append(tuple(s0[k] + (s1[k] - s0[k]) * f for k in (1, 2, 4, 5, 6, 3)))
+            out.append((s0[1] + (s1[1] - s0[1]) * f, s0[2] + (s1[2] - s0[2]) * f, s0[4] + (s1[4] - s0[4]) * f,
+                        s0[5] + (s1[5] - s0[5]) * f, s0[6] + (s1[6] - s0[6]) * f, s0[3] + (s1[3] - s0[3]) * f))
         return out
 
     def _fgo_fx_clamp2_track(e, life, birth, vx, vy, vz, grav, size, vel_mix, fz, gu=1.0, dmix=None, wrot=None,
@@ -4304,7 +4358,7 @@ init python:
         dsc = gu if cg_ == "gl" else e.get("clamp_k", 1.0)
         steps = _fgo_fx_clamp2_steps(c2, c2m, dc_, vol_at, F, g, life, pre, h, vx, vy, vz, size, dmix, nz, dsc,
                                     _fgo_fx_speed_at(e, life, smix) if "speedmod" in e else None, world is not None)
-        if nz is not None:
+        if nz is not None or _fgo_fx_lazy_tracks:
             return _FGOFXLazyTrack(first, steps, life)
         states = [first]
         states.extend(steps)
@@ -4318,8 +4372,25 @@ init python:
             s0, s1 = states[j], states[j + 1]
             f = (a - s0[0]) / (s1[0] - s0[0]) if s1[0] > s0[0] else 0.0
             f = min(1.0, max(0.0, f))
-            out.append(tuple(s0[k] + (s1[k] - s0[k]) * f for k in (1, 2, 4, 5, 6, 3)))
+            out.append((s0[1] + (s1[1] - s0[1]) * f, s0[2] + (s1[2] - s0[2]) * f, s0[4] + (s1[4] - s0[4]) * f,
+                        s0[5] + (s1[5] - s0[5]) * f, s0[6] + (s1[6] - s0[6]) * f, s0[3] + (s1[3] - s0[3]) * f))
         return out
+
+    # (runtime_performance 2026-10-23) Performance only, the same numbers: True = every Limit
+    # Velocity / world-step / wind track is resampled on demand (_FGOFXLazyTrack, the noise
+    # tracks' path: the same states, the same resampling arithmetic) instead of for the whole life
+    # when its chunk is built -- a burst of stepped particles no longer costs one frame seconds
+    # (bit_talk_07), and the tracks a chunk builds and then replaces cost nothing. False = eager.
+    _fgo_fx_lazy_tracks = True
+    # (runtime_performance) True = a lazy track keeps only its 1/30 s steps and computes each
+    # 1/240 s sample when asked (_FGOFXLazyTrack.sample: the same formula; a frame reads 2 of the
+    # 8 samples it passes, and 8x fewer objects stay alive); False = every sample is stored.
+    _fgo_fx_track_nostore = True
+    # (runtime_performance) True = orbit / radial tracks are computed on demand too
+    # (_FGOFXOrbitTrack, the eager resampling's formula): a prewarmed orbit chunk no longer
+    # integrates every particle's whole life at its first frame (bit_talk_bkn_light: 27 s).
+    _fgo_fx_lazy_orbit = True
+    from bisect import bisect_left as _fgo_fx_bisect_left
 
     def _fgo_fx_drag_step(c2, dc_, age, life, size, dmix, h, vx, vy, vz, vo, dsc=1.0):
         """One step of Limit Velocity's drag: |tot| -= drag h, tot = v + vol
@@ -4842,7 +4913,7 @@ init python:
             _fgo_fx_nz_inv[K] = got
         return got
 
-    class _FGOFXNoise(object):
+    class _FGOFXNoise(_FGO_FX_OBJECT):
         """One particle's noise: the simulation-space displacement D it adds,
         integrated lazily per frame step as frames are drawn (a mid-frame
         birth first takes the partial step d; a prewarmed particle is
@@ -4979,7 +5050,53 @@ init python:
 
     _fgo_fx_nz_offsets = {}
 
-    class _FGOFXLazyTrack(object):
+    class _FGOFXOrbitTrack(_FGO_FX_OBJECT):
+        """_fgo_fx_orbit_track's track computed on demand from its step generator: the steps
+        are stored, each 1/240 s sample is computed when asked with the eager resampling's
+        formula (velocity = the step's chord; j as in _FGOFXLazyTrack.sample)."""
+
+        def __init__(self, first, gen, life, p0):
+            self.states = [first]
+            self.times = [first[0]]
+            self.gen = gen
+            self.done = False
+            self.n = int(life / _FGO_FX_CLAMP_DT) + 3
+            self.p0 = p0
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, i):
+            if i < 0:
+                i += self.n
+            a = i * _FGO_FX_CLAMP_DT
+            states, times = self.states, self.times
+            if not self.done and (times[-1] < a or len(states) < 2):
+                gen = self.gen
+                try:
+                    while times[-1] < a or len(states) < 2:
+                        s_ = next(gen)
+                        states.append(s_)
+                        times.append(s_[0])
+                except StopIteration:
+                    self.done = True
+            j = _fgo_fx_bisect_left(times, a) - 1
+            if j > len(states) - 2:
+                j = len(states) - 2
+            if j < 0:
+                j = 0
+            s0, s1 = states[j], states[j + 1]
+            dt_ = s1[0] - s0[0]
+            f = min(1.0, max(0.0, (a - s0[0]) / dt_)) if dt_ > 0 else 0.0
+            x = s0[1] + (s1[1] - s0[1]) * f
+            y = s0[2] + (s1[2] - s0[2]) * f
+            z = s0[3] + (s1[3] - s0[3]) * f
+            p0 = self.p0
+            if dt_ > 0:
+                return (x - p0[0], -y - p0[1], (s1[1] - s0[1]) / dt_, -((s1[2] - s0[2]) / dt_), (s1[3] - s0[3]) / dt_, z - p0[2])
+            return (x - p0[0], -y - p0[1], 0.0, -0.0, 0.0, z - p0[2])
+
+    class _FGOFXLazyTrack(_FGO_FX_OBJECT):
         """A clamp track (the (x, y, vx, vy, vz, z) list every
         _FGO_FX_CLAMP_DT of age) computed on demand from a step generator --
         the same resampling as _fgo_fx_clamp2_track's (noise particles: their
@@ -4988,6 +5105,7 @@ init python:
 
         def __init__(self, first, gen, life):
             self.states = [first]
+            self.times = [first[0]]
             self.gen = gen
             self.done = False
             self.n = int(life / _FGO_FX_CLAMP_DT) + 3
@@ -5000,6 +5118,8 @@ init python:
         def __getitem__(self, i):
             if i < 0:
                 i += self.n
+            if _fgo_fx_track_nostore:
+                return self.sample(i)
             out = self.out
             while len(out) <= i:
                 a = len(out) * _FGO_FX_CLAMP_DT
@@ -5023,6 +5143,32 @@ init python:
                 f = min(1.0, max(0.0, f))
                 out.append(tuple(s0[k] + (s1[k] - s0[k]) * f for k in (1, 2, 4, 5, 6, 3)))
             return out[i]
+
+        def sample(self, i):
+            """Sample i computed from the stored steps, nothing else kept (the stored path's
+            values: its j is the first step whose successor reaches a, capped at len - 2, and the
+            step times only grow, so a bisection finds the same j)."""
+            a = i * _FGO_FX_CLAMP_DT
+            states, times = self.states, self.times
+            if not self.done and (times[-1] < a or len(states) < 2):
+                gen = self.gen
+                try:
+                    while times[-1] < a or len(states) < 2:
+                        s_ = next(gen)
+                        states.append(s_)
+                        times.append(s_[0])
+                except StopIteration:
+                    self.done = True
+            j = _fgo_fx_bisect_left(times, a) - 1
+            if j > len(states) - 2:
+                j = len(states) - 2
+            if j < 0:
+                j = 0
+            s0, s1 = states[j], states[min(j + 1, len(states) - 1)]
+            f = (a - s0[0]) / (s1[0] - s0[0]) if s1[0] > s0[0] else 0.0
+            f = min(1.0, max(0.0, f))
+            return (s0[1] + (s1[1] - s0[1]) * f, s0[2] + (s1[2] - s0[2]) * f, s0[4] + (s1[4] - s0[4]) * f,
+                    s0[5] + (s1[5] - s0[5]) * f, s0[6] + (s1[6] - s0[6]) * f, s0[3] + (s1[3] - s0[3]) * f)
 
     def _fgo_fx_size_axis(ax, u, f):
         """One sizeOverLifetime separateAxes axis at normalised age u, f =
@@ -5702,8 +5848,23 @@ init python:
         rows = ((cy_, sy_ * sx_, sy_ * cx_), (0.0, cx_, -sx_), (-sy_, cy_ * sx_, cy_ * cx_))
         return tuple((r[0] * cz_ + r[1] * sz_, -r[0] * sz_ + r[1] * cz_, r[2]) for r in rows)
 
+    # (runtime_performance) Performance only: True = _fgo_fx_m3mul without nested generators (the
+    # same sum() calls); False = the older generator form.
+    _fgo_fx_m3mul_flat = True
+
     def _fgo_fx_m3mul(A, B):
-        return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+        if not _fgo_fx_m3mul_flat:
+            return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+        # sum() over the same three products in the same order (Python 3.12's sum is compensated:
+        # an explicit a + b + c would not be the same bits); a tuple instead of nested generators
+        (a0, a1, a2), (b0, b1, b2), (c0, c1, c2) = A[0], A[1], A[2]
+        B0, B1, B2 = B[0], B[1], B[2]
+        return ((sum((a0 * B0[0], a1 * B1[0], a2 * B2[0])), sum((a0 * B0[1], a1 * B1[1], a2 * B2[1])),
+                 sum((a0 * B0[2], a1 * B1[2], a2 * B2[2]))),
+                (sum((b0 * B0[0], b1 * B1[0], b2 * B2[0])), sum((b0 * B0[1], b1 * B1[1], b2 * B2[1])),
+                 sum((b0 * B0[2], b1 * B1[2], b2 * B2[2]))),
+                (sum((c0 * B0[0], c1 * B1[0], c2 * B2[0])), sum((c0 * B0[1], c1 * B1[1], c2 * B2[1])),
+                 sum((c0 * B0[2], c1 * B1[2], c2 * B2[2]))))
 
     def _fgo_fx_velocity_G(spec, vx, vy, vz):
         """E1Velocity, 2026-10-03: the normal follows current velocity.
@@ -6289,6 +6450,178 @@ init python:
                 d = Transform(d, xzoom=qs[0], yzoom=qs[1])
             _fgo_fx_motes[key] = d
         return d
+
+    # Direct particle renders (notes/mesh_batch.md): a plain billboard's Render
+    # built the way Ren'Py's Transform builds it (xysize + zoom + rotate with
+    # rotate_pad, matrixcolor TintMatrix, alpha, blend), without constructing or
+    # rendering a Transform. The render tree is bit-identical to the Transform
+    # path's (sizes, every reverse / forward entry, the truncated rotate offset,
+    # shaders, uniforms, blend_func; 20,000 random particles), so the GL draws
+    # are the same. One mesh for many particles cannot be identical: Ren'Py rounds
+    # projection x particle matrix once, a shared mesh must round the corners
+    # first (1-level pixel flips). True = plain billboards (no mul / qs / geometry
+    # leaf / clip polygon) draw through this; False = the Transform path.
+    _fgo_fx_direct_motes = True
+    _fgo_fx_direct_tint = {}
+    _fgo_fx_direct_disp = {}
+    _FGO_FX_IDENTITY = Matrix.offset(0.0, 0.0, 0.0)
+
+    def _fgo_fx_mote_render(cell_key, w, h, rot, rgb, alpha, blend, st, at):
+        """renpy.render(_fgo_fx_mote(cell_key, w, h, rot, rgb, alpha, blend), ...), built directly."""
+        rot = _fgo_fx_rb(rot, _fgo_fx_step_for(w, h, None))
+        w, h = _fgo_mote_safe_size(w, h, rot)
+        c = _fgo_fx_cell(*cell_key)
+        d = _fgo_fx_direct_disp.get(c)
+        if d is None:
+            if len(_fgo_fx_direct_disp) > 4000:
+                _fgo_fx_direct_disp.clear()
+            d = _fgo_fx_direct_disp[c] = renpy.easy.displayable(c)
+        cr = renpy.render(d, w, h, st, at)
+        width, height = cr.get_size()
+        iw, ih = int(w), int(h)
+        # Ren'Py's order of operations (xysize, then xzoom / yzoom, then rotate)
+        rxdx = 1.0 * iw / width
+        rydy = 1.0 * ih / height
+        width, height = iw, ih
+        if iw != w or ih != h:
+            xz = 1.0 * (w / iw)
+            yz = 1.0 * (h / ih)
+            rxdx *= xz
+            width *= xz
+            rydy *= yz
+            height *= yz
+        rxdy = rydx = 0.0
+        xo = yo = 0.0
+        if rot:
+            angle = rot * 3.1415926535897931 / 180
+            cosa = math.cos(angle)
+            sina = math.sin(angle)
+            rxdy = rydy * -sina
+            rydx = rxdx * sina
+            rxdx *= cosa
+            rydy *= cosa
+            px = width / 2.0
+            py = height / 2.0
+            width = height = math.hypot(width, height)
+            xo = -px * cosa + py * sina
+            yo = -px * sina - py * cosa
+            xo += width / 2.0
+            yo += height / 2.0
+        rv = renpy.Render(width, height)
+        if rxdx != 1.0 or rydy != 1.0 or rxdy != 0.0 or rydx != 0.0:
+            rv.reverse = Matrix((rxdx, rxdy, 0, rydx, rydy, 0, 0, 0, 1))
+            rv.forward = rv.reverse.inverse()
+        rv.blit(cr, (xo, yo))
+        tm = _fgo_fx_direct_tint.get(rgb)
+        if tm is None:
+            if len(_fgo_fx_direct_tint) > 8000:
+                _fgo_fx_direct_tint.clear()
+            tm = _fgo_fx_direct_tint[rgb] = TintMatrix(Color(rgb=rgb))(None, 1.0)
+        rv.add_shader("renpy.matrixcolor")
+        rv.add_uniform("u_renpy_matrixcolor", tm)
+        if alpha != 1.0:
+            rv.add_shader("renpy.alpha")
+            rv.add_uniform("u_renpy_alpha", alpha)
+            rv.add_uniform("u_renpy_over", 1.0)
+        rv.add_property("blend_func", renpy.config.gl_blend_func[_fgo_blend_names.get(blend, "normal")])
+        rv.alpha = alpha
+        rv.over = 1.0
+        return rv
+
+    def _fgo_fx_cell_render(cell_key, w, h, st, at):
+        """renpy.render(Transform(_fgo_fx_cell(*cell_key), **_fgo_fx_xy(w, h)), ...), built directly."""
+        c = _fgo_fx_cell(*cell_key)
+        d = _fgo_fx_direct_disp.get(c)
+        if d is None:
+            if len(_fgo_fx_direct_disp) > 4000:
+                _fgo_fx_direct_disp.clear()
+            d = _fgo_fx_direct_disp[c] = renpy.easy.displayable(c)
+        cr = renpy.render(d, w, h, st, at)
+        width, height = cr.get_size()
+        iw, ih = int(w), int(h)
+        rxdx = 1.0 * iw / width
+        rydy = 1.0 * ih / height
+        width, height = iw, ih
+        if iw != w or ih != h:
+            xz = 1.0 * (w / iw)
+            yz = 1.0 * (h / ih)
+            rxdx *= xz
+            width *= xz
+            rydy *= yz
+            height *= yz
+        rv = renpy.Render(width, height)
+        if rxdx != 1.0 or rydy != 1.0:
+            rv.reverse = Matrix((rxdx, 0.0, 0, 0.0, rydy, 0, 0, 0, 1))
+            rv.forward = rv.reverse.inverse()
+        rv.blit(cr, (0.0, 0.0))
+        return rv
+
+    def _fgo_fx_mote_affine_render(cell_key, w, h, m, rgb, alpha, blend, st, at):
+        """renpy.render(_fgo_fx_mote_affine(cell_key, w, h, m, rgb, alpha, blend, None, False)), built
+        directly: matrixtransform m about matrixanchor (0.5, 0.5) of the sized cell."""
+        cr = _fgo_fx_cell_render(cell_key, w, h, st, at)
+        width, height = cr.get_size()
+        ax = 0.5 * width
+        ay = 0.5 * height
+        M = Matrix.offset(-ax, -ay, 0.0)
+        M = m * M
+        M = Matrix.offset(ax, ay, 0.0) * M
+        rv = renpy.Render(width, height)
+        rv.reverse = M * _FGO_FX_IDENTITY
+        rv.forward = rv.reverse.inverse()
+        rv.blit(cr, (0, 0))
+        tm = _fgo_fx_direct_tint.get(rgb)
+        if tm is None:
+            if len(_fgo_fx_direct_tint) > 8000:
+                _fgo_fx_direct_tint.clear()
+            tm = _fgo_fx_direct_tint[rgb] = TintMatrix(Color(rgb=rgb))(None, 1.0)
+        rv.add_shader("renpy.matrixcolor")
+        rv.add_uniform("u_renpy_matrixcolor", tm)
+        if alpha != 1.0:
+            rv.add_shader("renpy.alpha")
+            rv.add_uniform("u_renpy_alpha", alpha)
+            rv.add_uniform("u_renpy_over", 1.0)
+        rv.add_property("blend_func", renpy.config.gl_blend_func[_fgo_blend_names.get(blend, "normal")])
+        rv.alpha = alpha
+        rv.over = 1.0
+        return rv
+
+    def _fgo_fx_moteG_render(cell_key, w, h, G, rx, ry, rz, rgb, alpha, blend, st, at):
+        """renpy.render(_fgo_fx_moteG(...)) for mul None, no geometry leaf; None = edge-on."""
+        step = _fgo_fx_step_for(w, h, None, G)
+        rx = _fgo_fx_rb(rx, step)
+        ry = _fgo_fx_rb(ry, step)
+        rz = _fgo_fx_rb(rz, step)
+        w, h = _fgo_mote_safe_size(w, h, 1)
+        L = _fgo_fx_m3mul(G, _fgo_fx_rot3(rx, ry, rz, False))
+        L00, L01, L10, L11 = L[0][0], -L[0][1], -L[1][0], L[1][1]
+        if abs(L00 * L11 - L01 * L10) < 1e-6:
+            return None
+        m = Matrix([L00, L01, 0, 0, L10, L11, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+        return _fgo_fx_mote_affine_render(cell_key, w, h, m, rgb, alpha, blend, st, at)
+
+    def _fgo_fx_moteS_render(cell_key, A, B, rgb, alpha, blend, st, at):
+        """renpy.render(_fgo_fx_moteS(...)) for mul None, no clip polygon; None = degenerate."""
+        la, lb = math.hypot(*A), math.hypot(*B)
+        if la < 1.0 or lb < 0.5:
+            return None
+        step = _fgo_fx_step_reach(0.5 * math.hypot(la, lb))
+        if _fgo_fx_rot_exact_all:
+            aa = _fgo_fx_rb(math.degrees(math.atan2(A[1], A[0])), step)
+            ab = _fgo_fx_rb(math.degrees(math.atan2(B[1], B[0])), step)
+            if abs(math.sin(math.radians(ab - aa))) < 1e-6:
+                return None
+        else:
+            aa = int(round(math.degrees(math.atan2(A[1], A[0])) / step) * step) % 360
+            ab = int(round(math.degrees(math.atan2(B[1], B[0])) / step) * step) % 360
+            if (ab - aa) % 180 == 0:
+                return None
+        w, h = int(round(la)), max(1, int(round(lb)))
+        w, h = _fgo_fx_wh(la, lb, w, h)
+        ca, sa = math.cos(math.radians(aa)), math.sin(math.radians(aa))
+        cb, sb = math.cos(math.radians(ab)), math.sin(math.radians(ab))
+        m = Matrix([ca, cb, 0, 0, sa, sb, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+        return _fgo_fx_mote_affine_render(cell_key, w, h, m, rgb, alpha, blend, st, at)
 
     class _FGOFXCropBlank(renpy.Displayable):
         """Geometry-only child: measuring a transform allocates no texture."""
@@ -7518,6 +7851,34 @@ init python:
                 ox, oy = _fgo_fx_track(tox, ph, u, au), _fgo_fx_track(toy, ph, u, au)
         return (sx, sy, round(ox, 4), round(oy, 4), uv["wrap"][0], uv["wrap"][1])
 
+    # (runtime_performance 2026-10-23) Performance only: True = a particle with a track skips the
+    # velocity / gravity / Force / VOL-curve terms the track overwrites anyway; False = computes them
+    # first, as before (the same returned numbers either way).
+    _fgo_fx_disp_track_first = True
+
+    def _fgo_fx_disp_track(track, age, lx):
+        """_fgo_fx_disp for a particle with a track (+ its noise)."""
+        fi = age / _FGO_FX_CLAMP_DT
+        i0 = min(int(fi), len(track) - 2)
+        f = fi - i0
+        a0, a1 = track[i0], track[i0 + 1]
+        disp_x = a0[0] + (a1[0] - a0[0]) * f
+        disp_y = a0[1] + (a1[1] - a0[1]) * f
+        cvx = a0[2] + (a1[2] - a0[2]) * f
+        cvy = a0[3] + (a1[3] - a0[3]) * f
+        cvz = a0[4] + (a1[4] - a0[4]) * f
+        dzz = a0[5] + (a1[5] - a0[5]) * f
+        nzs_ = lx.get("nz") if lx else None
+        if nzs_ is not None:
+            n_ = nzs_.at(age)
+            disp_x += n_[0]
+            disp_y += n_[1]
+            dzz += n_[2]
+            cvx += n_[3]
+            cvy += n_[4]
+            cvz += n_[5]
+        return disp_x, disp_y, dzz, cvx, cvy, cvz
+
     def _fgo_fx_disp(e, p, age, g_u, vol_curves, vm):
         """A particle's displacement and current velocity at `age`: (disp_x,
         disp_y, dzz, cvx, cvy, cvz), world units, screen-oriented (y down);
@@ -7526,6 +7887,9 @@ init python:
         read its parent particle's path (_fgo_fx_sub_anchor)."""
         (birth, life, ox, oy, vx, vy, vcx, vcy, grav, size, size_y, rot0, spin,
          tint_rgb, tint_a, frame, size_mix, vel_mix, track, vz, row_base, bxy, tilt, oz, mx, fz, lx) = p
+        if track is not None and _fgo_fx_disp_track_first:
+            # a track replaces every value computed below (only the noise adds on top)
+            return _fgo_fx_disp_track(track, age, lx)
         u = age / life
         # Velocity-driven displacement (world units), screen-oriented
         # (y down). startSpeed (vx, vy) and constant VOL (vcx, vcy) were
@@ -7595,16 +7959,7 @@ init python:
             cvy += fvy
             cvz += fvz
         if track is not None:
-            fi = age / _FGO_FX_CLAMP_DT
-            i0 = min(int(fi), len(track) - 2)
-            f = fi - i0
-            a0, a1 = track[i0], track[i0 + 1]
-            disp_x = a0[0] + (a1[0] - a0[0]) * f
-            disp_y = a0[1] + (a1[1] - a0[1]) * f
-            cvx = a0[2] + (a1[2] - a0[2]) * f
-            cvy = a0[3] + (a1[3] - a0[3]) * f
-            cvz = a0[4] + (a1[4] - a0[4]) * f
-            dzz = a0[5] + (a1[5] - a0[5]) * f
+            return _fgo_fx_disp_track(track, age, lx)
         nzs_ = lx.get("nz") if lx else None
         if nzs_ is not None:
             # noise [approximated, statistically matched 2026-09-28]:
@@ -8694,11 +9049,16 @@ init python:
                         ox_, oy_ = _fgo_fx_stretch_pivot_x(cvx, cvy, raw_x, raw_y, ss_[0], cap, len_, e["pivot_x"])
                         Px += ox_
                         Py += oy_
-                    mote = _fgo_fx_moteS(cell, (Ax, Ay), (-Wx, -Wy), rgb, a2, e["blend"], mat_mul)
-                    if mote is None:
-                        continue
+                    if _fgo_fx_direct_motes and mat_mul is None and len(cell) <= 6:
+                        cr = _fgo_fx_moteS_render(cell, (Ax, Ay), (-Wx, -Wy), rgb, a2, e["blend"], st, at)
+                        if cr is None:
+                            continue
+                    else:
+                        mote = _fgo_fx_moteS(cell, (Ax, Ay), (-Wx, -Wy), rgb, a2, e["blend"], mat_mul)
+                        if mote is None:
+                            continue
+                        cr = renpy.render(mote, 1, 1, st, at)
                     qx, qy = px + Px + Ax * 0.5, py + Py + Ay * 0.5
-                    cr = renpy.render(mote, 1, 1, st, at)
                     cw, ch = cr.get_size()
                     if _fgo_fx_debug is not None:
                         # + the corners (u, v) = (0,0) (0,1) (1,0) (1,1), screen px
@@ -8808,10 +9168,15 @@ init python:
                         if clip_poly_ == ():
                             continue
                     if side_ is not None:
-                        mote = _fgo_fx_moteS(cell, (-length * ux, -length * uy), side_, rgb, a2, e["blend"], mat_mul, clip_poly_)
-                        if mote is None:
-                            continue
-                        cr = renpy.render(mote, 1, 1, st, at)
+                        if _fgo_fx_direct_motes and mat_mul is None and clip_poly_ is None and len(cell) <= 6:
+                            cr = _fgo_fx_moteS_render(cell, (-length * ux, -length * uy), side_, rgb, a2, e["blend"], st, at)
+                            if cr is None:
+                                continue
+                        else:
+                            mote = _fgo_fx_moteS(cell, (-length * ux, -length * uy), side_, rgb, a2, e["blend"], mat_mul, clip_poly_)
+                            if mote is None:
+                                continue
+                            cr = renpy.render(mote, 1, 1, st, at)
                         cw, ch = cr.get_size()
                         if _fgo_fx_debug is not None:
                             _fgo_fx_debug.append((ei, e["name"], px, py, w, h, a2))
@@ -8894,10 +9259,15 @@ init python:
                     qx_, qy_ = (qs[0], qs[1]) if qs is not None else (1.0, 1.0)
                     ux_, uy_ = k_ * raw_x * cz_ * qx_, -k_ * raw_y * sz_ * qy_      # world, y up
                     vx_, vy_ = k_ * raw_x * sz_ * qx_, k_ * raw_y * cz_ * qy_
-                    mote = _fgo_fx_moteS(cell, (ux_, -uy_), (-vx_, vy_), rgb, a2, e["blend"], mat_mul)
-                    if mote is None:
-                        continue
-                    cr = renpy.render(mote, 1, 1, st, at)
+                    if _fgo_fx_direct_motes and mat_mul is None and len(cell) <= 6:
+                        cr = _fgo_fx_moteS_render(cell, (ux_, -uy_), (-vx_, vy_), rgb, a2, e["blend"], st, at)
+                        if cr is None:
+                            continue
+                    else:
+                        mote = _fgo_fx_moteS(cell, (ux_, -uy_), (-vx_, vy_), rgb, a2, e["blend"], mat_mul)
+                        if mote is None:
+                            continue
+                        cr = renpy.render(mote, 1, 1, st, at)
                     cw, ch = cr.get_size()
                     if _fgo_fx_debug is not None:
                         _fgo_fx_debug.append((ei, e["name"], px, py, w, h, a2))
@@ -8921,6 +9291,16 @@ init python:
                     rx_, ry_ = _fgo_fx_tilt_at(tilt, lx, age)
                     # BigMesh: a quad the safe size would shrink -> geometry leaf
                     geo_ = _fgo_fx_big_mesh and (_fgo_fx_big_mesh_all or _fgo_mote_safe_size(w, h, 1) != (w, h))
+                    if _fgo_fx_direct_motes and mat_mul is None and not geo_ and len(cell) <= 6:
+                        cr = _fgo_fx_moteG_render(cell, *_fgo_fx_wh(wf, hf, w, h), G_use_ if gpx_ else G, rx_, ry_, rot, rgb, a2,
+                                                  e["blend"], st, at)
+                        if cr is None:
+                            continue     # edge-on
+                        cw, ch = cr.get_size()
+                        if _fgo_fx_debug is not None:
+                            _fgo_fx_debug.append((ei, e["name"], px, py, w, h, a2))
+                        _fgo_fx_blit(rv, cr, px - cw * 0.5, py - ch * 0.5)
+                        continue
                     mote = _fgo_fx_moteG(cell, *_fgo_fx_wh(wf, hf, w, h), G_use_ if gpx_ else G, rx_, ry_, rot, rgb, a2, e["blend"],
                                          mat_mul, geo_)
                     if mote is None:
@@ -8947,6 +9327,14 @@ init python:
                         continue
                     rb_ = _fgo_fx_rb(rot, _fgo_fx_step_for(w, h, qs))
                     geo_ = _fgo_fx_big_mesh and (_fgo_fx_big_mesh_all or _fgo_mote_safe_size(w, h, rb_) != (w, h))
+                    if (_fgo_fx_direct_motes and mat_mul is None and e.get("quad_scale") is None and not geo_
+                            and clip_poly_ is None and len(cell) <= 6):
+                        cr = _fgo_fx_mote_render(cell, *_fgo_fx_wh(wf, hf, w, h), rot, rgb, a2, e["blend"], st, at)
+                        cw, ch = cr.get_size()
+                        if _fgo_fx_debug is not None:
+                            _fgo_fx_debug.append((ei, e["name"], px, py, w, h, a2))
+                        _fgo_fx_blit(rv, cr, px - cw * 0.5, py - ch * 0.5)
+                        continue
                     mote = _fgo_fx_mote(cell, *_fgo_fx_wh(wf, hf, w, h), rot, rgb, a2, e["blend"], mat_mul, e.get("quad_scale"), geo_, clip_poly_)
                 cr = renpy.render(mote, w, h, st, at)
                 cw, ch = cr.get_size()
@@ -8960,3 +9348,83 @@ init python:
         def visit(self):
             return []
 
+# --- plain containers in the render path (runtime_performance, see _fgo_fx_plain) -------------
+init 999 python:
+
+    import builtins as _fgo_fx_builtins
+    _fgo_fx_py_range = _fgo_fx_builtins.range
+    _fgo_fx_py_sorted = _fgo_fx_builtins.sorted
+    # the store names Ren'Py's compiler emits or rebinds -> the plain built-ins
+    _FGO_FX_PLAIN_NAMES = {"__renpy__list__": "python_list", "list": "python_list",
+                           "__renpy__dict__": "python_dict", "dict": "python_dict",
+                           "__renpy__set__": "python_set", "set": "python_set",
+                           "range": "_fgo_fx_py_range", "sorted": "_fgo_fx_py_sorted"}
+    # the public API keeps Ren'Py's rollback-aware types (it touches the scene and _fgo_fx_active)
+    _FGO_FX_PLAIN_KEEP = ("fgo_fx_register", "fgo_fx_show", "fgo_fx_stop", "fgo_fx_hide", "fgo_fx_hide_all",
+                          "_fgo_fx_plain_data", "_fgo_fx_plain_code", "_fgo_fx_plain_fn", "_fgo_fx_plain_patch")
+
+    def _fgo_fx_plain_code(co):
+        """co with the Revertable names in its global lookups (and its nested code) renamed."""
+        names = tuple(_FGO_FX_PLAIN_NAMES.get(n, n) for n in co.co_names)
+        consts = tuple(_fgo_fx_plain_code(c) if isinstance(c, type(co)) else c for c in co.co_consts)
+        if names == co.co_names and consts == co.co_consts:
+            return co
+        return co.replace(co_names=names, co_consts=consts)
+
+    def _fgo_fx_plain_fn(f):
+        import types
+        co = _fgo_fx_plain_code(f.__code__)
+        if co is f.__code__:
+            return f
+        g = types.FunctionType(co, f.__globals__, f.__name__, f.__defaults__, f.__closure__)
+        g.__kwdefaults__ = f.__kwdefaults__
+        g.__dict__.update(f.__dict__)
+        g.__qualname__ = f.__qualname__
+        g.__doc__ = f.__doc__
+        g.__module__ = f.__module__
+        return g
+
+    def _fgo_fx_plain_patch():
+        import types
+        def ours(f):
+            return isinstance(f, types.FunctionType) and f.__code__.co_filename.replace("\\", "/").endswith("fgo_fx_runtime.rpy")
+        n = 0
+        for k, v in list(store.__dict__.items()):
+            if k in _FGO_FX_PLAIN_KEEP:
+                continue
+            if ours(v):
+                setattr(store, k, _fgo_fx_plain_fn(v))
+                n += 1
+            elif isinstance(v, type) and v.__module__ == "store":
+                for mk, mv in list(v.__dict__.items()):
+                    if ours(mv):
+                        setattr(v, mk, _fgo_fx_plain_fn(mv))
+                        n += 1
+                    elif isinstance(mv, (staticmethod, classmethod)) and ours(mv.__func__):
+                        setattr(v, mk, type(mv)(_fgo_fx_plain_fn(mv.__func__)))
+                        n += 1
+        return n
+
+    # the runtime's own caches (a Revertable container logs itself for rollback on its first change
+    # in every interaction and keeps a copy); the per-play clocks and _fgo_fx_active stay Revertable
+    _FGO_FX_PLAIN_CACHES = (
+        "_fgo_fx_sub_parents", "_fgo_fx_clip_last_cache", "_fgo_fx_destroy_totals", "_fgo_fx_mt_layout",
+        "_fgo_fx_mt_tex", "_fgo_fx_int_tables", "_fgo_fx_rate_tabs", "_fgo_fx_dist_cache", "_fgo_fx_rate_cache",
+        "_fgo_fx_oneshot_cache", "_fgo_fx_cycle_cache", "_fgo_fx_color_key_cache", "_fgo_fx_color_tint_cache",
+        "_fgo_fx_fclock_cache", "_fgo_fx_loopoff_cache", "_fgo_fx_wrot_cache", "_fgo_fx_cap_state",
+        "_fgo_fx_pw_sched_cache", "_fgo_fx_shape_pixels", "_fgo_fx_burst_cache", "_fgo_fx_bsched_cache",
+        "_fgo_fx_sv_clocks", "_fgo_fx_sv_rate_frames", "_fgo_fx_sv_gravity_cache", "_fgo_fx_pw_ks_cache",
+        "_fgo_fx_nz_inv", "_fgo_fx_nz_offsets", "_fgo_fx_chunk_cache", "_fgo_fx_mesh_layout", "_fgo_fx_sheet_disp",
+        "_fgo_fx_cells", "_fgo_fx_motes", "_fgo_fx_quad_layout", "_fgo_fx_quad_tex", "_fgo_fx_crop_geometry",
+        "_fgo_fx_crops", "_fgo_fx_sub_cache", "_fgo_fx_sub_state", "_fgo_fx_nz_G3", "_fgo_fx_nz_G2", "_fgo_fx_nz_G1")
+
+    def _fgo_fx_plain_caches():
+        for k in _FGO_FX_PLAIN_CACHES:
+            v = store.__dict__.get(k)
+            for base in (python_dict, python_list, python_set):
+                if isinstance(v, base) and type(v) is not base:
+                    setattr(store, k, base(v))       # shallow: the keys / values stay the same objects
+
+    if _fgo_fx_plain:
+        _fgo_fx_plain_count = _fgo_fx_plain_patch()
+        _fgo_fx_plain_caches()

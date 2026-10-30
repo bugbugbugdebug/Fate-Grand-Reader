@@ -575,33 +575,112 @@ init -30 python:
         # toggle live so its indicator stays visible and Tab can change it.
         return renpy.call_screen("reader_choice", options)
 
-    def vn_play_nodes(nodes, api):
+    def vn_record_choice(selected):
+        """JumpScriptSwitchCase: a menu after [input selectBranch] stores its 0-based index in the static
+        select-branch index and the INPUT_SELECT_BRANCH flag (later scripts branch on it)."""
+        if renpy.store.vn_select_branch_pending and selected is not None:
+            renpy.store.vn_select_branch_pending = False
+            renpy.store.vn_select_branch_index = int(selected)
+            renpy.store.vn_script_flags["INPUT_SELECT_BRANCH"] = str(int(selected))
+
+    def vn_flow_command(node):
+        """Script flow control. Returns (handled, jump label or None).
+        [label X]: jump target. [branch X]: jump. [branch X FLAG V]: jump when flag FLAG == V.
+        [flag FLAG V]: set a flag. [masterBranch MALE FEMALE]: jump by master gender.
+        [input selectBranch]: the next menu records its index (see vn_record_choice)."""
+        if node.get("type") != "command":
+            return False, None
+        name = str(node.get("name") or "").lower()
+        args = [str(a) for a in (node.get("args") or [])]
+        if name == "label":
+            return True, None
+        if name == "branch":
+            if not args:
+                return True, None
+            if len(args) >= 3:
+                if renpy.store.vn_script_flags.get(args[1]) != args[2]:
+                    return True, None
+            return True, args[0]
+        if name == "flag":
+            if len(args) >= 2:
+                renpy.store.vn_script_flags[args[0]] = args[1]
+            return True, None
+        if name == "masterbranch":
+            if not args:
+                return True, None
+            gender = 1 if int(renpy.store.vn_player_gender or 0) else 0
+            return True, args[min(gender, len(args) - 1)]
+        if name == "input" and args and args[0] == "selectBranch":
+            renpy.store.vn_select_branch_pending = True
+            return True, None
+        if name == "selectionuse":
+            # [selectionUse masterMale|masterFemale]: the next menu only exists for that master gender.
+            renpy.store.vn_selection_use = args[0] if args else None
+            return True, None
+        return False, None
+
+    def vn_selection_allowed():
+        """Consumes a pending [selectionUse]; False when the next menu belongs to the other gender."""
+        cond = renpy.store.vn_selection_use
+        renpy.store.vn_selection_use = None
+        gender = 1 if int(renpy.store.vn_player_gender or 0) else 0
+        if cond == "masterMale":
+            return gender == 0
+        if cond == "masterFemale":
+            return gender == 1
+        return True
+
+    def vn_find_label(nodes, label, start):
+        """SearchBranchLabel: forward from the current command first, then from the top."""
+        order = list(range(start, len(nodes))) + list(range(0, start))
+        for i in order:
+            n = nodes[i]
+            if n.get("type") == "command" and str(n.get("name") or "").lower() == "label":
+                if [str(a) for a in (n.get("args") or [])][:1] == [label]:
+                    return i
+        return None
+
+    def vn_play_nodes(nodes, api, nested=False):
+        """Plays nodes in order. A [branch]/[masterBranch] jump whose [label] is not in this list (e.g. a
+        [branch] inside a menu option) is returned to the enclosing call, which owns the label."""
         idx = 0
         while idx < len(nodes):
             node = nodes[idx]
             node_type = node.get("type")
+            jump = None
             if node_type == "dialogue":
                 vn_say(node, api)
             elif node_type == "choice":
                 vn_apply_music_flag(get_scene_music_flag(node, api))
                 choice_options, next_idx = collect_choice_options(nodes, idx)
-                if choice_options:
-                    vn_choose(choice_options)
+                if choice_options and vn_selection_allowed():
+                    vn_record_choice(vn_choose(choice_options))
                 idx = next_idx - 1
             elif node_type == "choice_block":
                 cb_choices = node.get("choices", [])
                 cb_texts = [normalize_choice_text(c.get("text", "")) for c in cb_choices]
-                if cb_texts:
+                if cb_texts and vn_selection_allowed():
                     selected = vn_choose(cb_texts)
+                    vn_record_choice(selected)
                     if selected is not None and selected < len(cb_choices):
-                        vn_play_nodes(cb_choices[selected].get("nodes", []), api)
+                        jump = vn_play_nodes(cb_choices[selected].get("nodes", []), api, nested=True)
             else:
-                flag = get_scene_music_flag(node, api)
-                if flag:
-                    vn_apply_music_flag(flag)
-                else:
-                    apply_reader_node(node, api)
+                handled, jump = vn_flow_command(node)
+                if not handled:
+                    flag = get_scene_music_flag(node, api)
+                    if flag:
+                        vn_apply_music_flag(flag)
+                    else:
+                        apply_reader_node(node, api)
+            if jump:
+                target = vn_find_label(nodes, jump, idx)
+                if target is not None:
+                    idx = target
+                elif nested:
+                    return jump
+                # A missing label at the top level: keep reading in order.
             idx += 1
+        return None
 
     def vn_reset_stage():
         vn_fx_reset()
@@ -643,3 +722,7 @@ init -30 python:
         renpy.store.vn_pictureframe_width = vn_picture_frame_script_width()
         renpy.store.vn_fade = {"from": 1.0, "to": 1.0, "start": vn_now(), "dur": 0.0, "color": "#000000"}
         renpy.store.vn_phase_fade_seen = False
+        # Each script's flag list starts with INPUT_SELECT_BRANCH = the static select-branch index.
+        renpy.store.vn_script_flags = {"INPUT_SELECT_BRANCH": str(int(renpy.store.vn_select_branch_index or 0))}
+        renpy.store.vn_select_branch_pending = False
+        renpy.store.vn_selection_use = None

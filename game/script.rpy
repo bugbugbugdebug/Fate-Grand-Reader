@@ -90,6 +90,10 @@ default vn_skip_mode = False            # custom skip mode (Tab to toggle; not p
 default vn_skip_allowed = True          # script [skip false/true] temporarily gates fast-forward
 default vn_unrendered_wait = False      # next [wt] belongs to an effect/SFX the port did not draw/play
 default vn_unrendered_movie = False     # suppress a movie's pacing waits until its replacement scene arrives
+default vn_script_flags = {}            # ScriptManager flagDataList ([flag NAME V], INPUT_SELECT_BRANCH)
+default vn_select_branch_index = 0      # ScriptManager.SetSelectBranchIndex (static: survives scripts)
+default vn_select_branch_pending = False  # isSelectBranch: [input selectBranch] seen, next choice records its index
+default vn_selection_use = None         # pending [selectionUse masterMale|masterFemale] gate for the next menu
 default vn_require_input = vn_settings_loaded["requireInput"]   # manual scroll past the visible window
 default vn_offline = vn_settings_loaded["offline"]              # skip all network requests (cache only)
 
@@ -166,7 +170,7 @@ init -100 python:
 
     def normalize_choice_text(text):
         text = str(text or "").strip()
-        text = text.lstrip("0123456789")
+        text = text.lstrip("0123456789,，")
         text = text.lstrip(":：").strip()
         return text
 

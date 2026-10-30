@@ -865,8 +865,9 @@ init -40 python:
             running = running or r
             root_x = (VN_SUB_CAPTURE / 2.0 if capture else 512.0) + float(pos[0]) + float(rel[0])
             root_y = (VN_SUB_CAPTURE / 2.0 if capture else 288.0) - float(pos[1]) - float(rel[1])  # NGUI +y is up
-            ox = float(data.get("offset_x") or 0)
-            oy = float(data.get("offset_y") or 0)
+            # A charaChange fade's outgoing figure keeps its own svtScript offsets.
+            ox = float(src.get("offset_x", data.get("offset_x")) or 0)
+            oy = float(src.get("offset_y", data.get("offset_y")) or 0)
             scale = float(scale)
 
             # communicationCharaEffect noise: a brief static burst on a 2.0 s heartbeat (approximation; the
@@ -1691,16 +1692,28 @@ init -40 python:
     # Music
     # ------------------------------------------------------------------
 
+    def vn_bgm_play_flag(parts, api):
+        """[bgm NAME (FADE (VOLUME))]: e.g. [bgm X 0.8 0.5] ... [bgm X 0.8 1.0] dips the playing track to
+        half volume and back over 0.8 s (a re-issue of the playing BGM never restarts it, see
+        vn_apply_music_flag)."""
+        path = api.get_bgm_path(parts[1])
+        if not path:
+            return None
+        try:
+            fadein = float(parts[2]) if len(parts) >= 3 else 0.2
+        except Exception:
+            fadein = 0.2
+        try:
+            volume = float(parts[3]) if len(parts) >= 4 else 1.0
+        except Exception:
+            volume = 1.0
+        return {"action": "play", "path": path.replace("\\", "/"), "fade": fadein, "volume": volume, "name": parts[1]}
+
     def get_scene_music_flag(node, api):
         if node.get("type") == "bgm":
             parts = (node.get("tags") or {}).get("bgm", "").split()
-            path = api.get_bgm_path(node.get("name"))
-            if path:
-                try:
-                    fadein = float(parts[2]) if len(parts) >= 3 else 0.2
-                except Exception:
-                    fadein = 0.2
-                return {"action": "play", "path": path.replace("\\", "/"), "fade": fadein, "name": node.get("name")}
+            if len(parts) >= 2:
+                return vn_bgm_play_flag(parts, api)
         if node.get("type") == "audio_stop":
             token = next(iter((node.get("tags") or {}).values()), "")
             parts = token.split()
@@ -1721,13 +1734,9 @@ init -40 python:
             parts = (token or key).split()
             command = parts[0].lower() if parts else ""
             if command == "bgm" and len(parts) >= 2:
-                path = api.get_bgm_path(parts[1])
-                if path:
-                    try:
-                        fadein = float(parts[2]) if len(parts) >= 3 else 0.2
-                    except Exception:
-                        fadein = 0.2
-                    return {"action": "play", "path": path.replace("\\", "/"), "fade": fadein, "name": parts[1]}
+                flag = vn_bgm_play_flag(parts, api)
+                if flag:
+                    return flag
             elif command in ("bgmstop", "bgmstopend"):
                 return vn_bgm_stop_flag(parts)
             elif command == "soundstopall":
@@ -1757,7 +1766,15 @@ init -40 python:
         if not flag:
             return
         if flag.get("action") == "play" and flag.get("path"):
-            renpy.music.play(flag.get("path"), fadein=flag.get("fade", 0.2))
+            volume = max(0.0, min(1.0, float(flag.get("volume", 1.0))))
+            fade = max(0.0, float(flag.get("fade", 0.2)))
+            playing = renpy.music.get_playing(channel="music") is not None
+            if playing and flag.get("name") == renpy.store.vn_bgm_name:
+                # BgmPlayerBase.PlayBgm: the playing BGM keeps its position; only ChangeVolume(volume, fade).
+                renpy.music.set_volume(volume, delay=fade, channel="music")
+                return
+            renpy.music.set_volume(volume, delay=0, channel="music")
+            renpy.music.play(flag.get("path"), fadein=fade)
             renpy.store.vn_bgm_name = flag.get("name")
         elif flag.get("action") == "stop":
             fade = flag.get("fade", 0.2)
@@ -1991,6 +2008,11 @@ init -40 python:
             return vn_chara_face_fade(args, defs)
         if name == "imageChange":
             return vn_image_change(args, defs, api)
+        if name == "charaChange":
+            return vn_chara_figure_change(args[:2] + args[2:3] + args[4:5], defs, api,
+                                          args[3] if len(args) >= 5 else "")
+        if name == "charaCrossFade":
+            return vn_chara_figure_change(args, defs, api, "crossFade")
         if lname == "messageoff":
             vn_message_off()
             return True

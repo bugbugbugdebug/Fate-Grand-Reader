@@ -41,6 +41,19 @@
 #       change after charaSet comes out without the talk dim until the next SetTalkIndex.
 #       Not blocking at normal speed ([wait charaCrossFade]/[wait charaChange] poll IsChange).
 #
+#   [charaCrossFade S ID FACE T] / [charaChange S ID FACE KIND T]
+#       ChangeCharacter("crossFade" | KIND, T, ID, FACE): the slot's other figure loads svt
+#       image ID (its own sheet and svtScript offsets) at FACE. Arg order is from the corpus
+#       (1,409 / 841 uses, always 4 / 5 args). UIScriptFigure.UpdateChange by kind:
+#         crossFade (4): the charaFaceFade blend above, old figure -> new figure. FGO only
+#                 refuses it for wide/high mixes (IsEnableCrossFade), which this reader lacks.
+#         fade (2):  old MoveAlpha(T, 0) under new MoveAlpha(T, 1) (the slot's `back` record,
+#                 drawn with the old sheet and offsets); [wait charaFade] covers it.
+#         blink (3): FGO flickers between the two; treated as normal here (7 corpus uses).
+#         else (1):  EndChange at once. Kind strings are case-sensitive: "nomal"/"Fade" too.
+#       EndChange leaves the new figure at alpha 1 with the shadow flag kept, and the
+#       first change after charaSet drops the talk mask exactly as charaFaceFade does.
+#
 #   [imageChange S IMAGE KIND T (SCALETYPE)]  >= 4 args, else "parameter error".
 #       Normal speed: ChangeCharacter(KIND, T, IMAGE, 0). Other speeds: SetCharacter (instant).
 #       Afterwards the script WAITs "charaSet", which only holds while the asset loads.
@@ -140,12 +153,14 @@ init -35 python:
         xf = vn_chara_crossfade(data)
         if xf is None:
             return None
-        key = (slot, xf["start"], xf["from_face"], xf["to_face"], data.get("path"))
+        # charaChange/charaCrossFade blend from the previous figure's own sheet and face layout.
+        old = xf.get("from_figure") or data
+        key = (slot, xf["start"], xf["from_face"], xf["to_face"], old.get("path"), data.get("path"))
         disp = _vn_crossfade_cache.get(key)
         if disp is None:
             _vn_crossfade_cache.clear()     # only ever a handful alive; drop finished ones
             disp = VNFigureCrossFade(slot,
-                                     vn_chara_composite(data, xf["from_face"]),
+                                     vn_chara_composite(old, xf["from_face"]),
                                      vn_chara_composite(data, xf["to_face"]),
                                      xf["start"], xf["dur"])
             _vn_crossfade_cache[key] = disp
@@ -283,6 +298,69 @@ init -35 python:
         data["changed"] = True
         return True
 
+    VN_FIGURE_SHEET_KEYS = ("id", "path", "face", "face_x", "face_y", "face_size",
+                            "offset_x", "offset_y")
+
+    def vn_chara_figure_change(args, defs, api, kind):
+        """[charaChange S ID FACE KIND T] / [charaCrossFade S ID FACE T]: swap a standing
+        figure for another svt image, ChangeCharacter(KIND, T, ID, FACE)."""
+        if len(args) < 4:
+            return True                              # parameter error
+        data = vn_chara_slot(defs, args[0])
+        if data is None or data.get("kind") not in (None, "chara"):
+            return True
+        chara_id = str(args[1])
+        try:
+            face = str(int(args[2]))                 # Int32.Parse
+        except Exception:
+            return True
+        duration = 0.0 if vn_skipping() else max(0.0, vn_float(args[3], 0.0))
+        now = vn_now()
+        old = dict((k, data.get(k)) for k in VN_FIGURE_SHEET_KEYS)
+        old["face"] = str(old.get("face") or "0")
+        old_alpha = max(0.0, min(1.0, float(vn_slot_alpha(data, now))))
+
+        char_path = api.get_character_path(chara_id)
+        offsets = api.get_chara_script_offsets(chara_id) or {}
+        data.update({
+            "id": chara_id,
+            "path": char_path.replace("\\", "/") if char_path else None,
+            "face_x": offsets.get("face_x") or 0,
+            "face_y": offsets.get("face_y") or 0,
+            "face_size": offsets.get("face_size") or 256,
+            "offset_x": offsets.get("offset_x") or 0,
+            "offset_y": offsets.get("offset_y") or 0,
+        })
+
+        data["xfade"] = None
+        data["back"] = None
+        if duration > 0.0 and old.get("path") and data.get("path") and kind == "crossFade":
+            # IsEnableCrossFade only refuses wide/high mixes; this reader has neither.
+            data["xfade"] = {"from_face": old["face"], "to_face": face, "from_figure": old,
+                             "start": now, "dur": duration,
+                             "tint": vn_chara_tint_value(data), "alpha": old_alpha}
+            data["alpha_anim"] = None
+        elif duration > 0.0 and old.get("path") and kind == "fade":
+            # Old figure MoveAlpha(T, 0) under the new one's MoveAlpha(T, 1) (depth 0 vs 0.1).
+            old["kind"] = "chara"
+            old["alpha_anim"] = vn_anim(old_alpha, 0.0, duration)
+            data["back"] = old
+            data["alpha_anim"] = vn_anim(0.0, 1.0, duration)
+            vn_mark_busy_max("charaFadeNoTalk", duration)
+        else:
+            # "normal" and anything unrecognised (kind strings are case-sensitive, so the
+            # corpus's "nomal"/"Fade" land here) end at once. "blink" is also instant here.
+            duration = 0.0
+            data["alpha_anim"] = None
+        data["change_end"] = now + duration
+        # State after EndChange: the new figure at alpha 1, shadow flag kept.
+        data["face"] = face
+        data["alpha"] = 1.0
+        if not data.get("changed"):
+            data["talk_mask"] = False                # backIndex was -1 (see charaFaceFade)
+        data["changed"] = True
+        return True
+
     def vn_wait_chara_change(slot=None):
         """[wait charaChange|charaCrossFade (SLOT)]: hold while IsChange (changeKind != 0)."""
         defs = renpy.store.current_chara_defs
@@ -313,5 +391,7 @@ init -35 python:
     def vn_slot_back_image(slot):
         data = renpy.store.current_chara_defs.get(slot) or {}
         back = data.get("back") or {}
+        if back.get("kind") == "chara":              # outgoing figure of a charaChange fade
+            return vn_chara_composite(back, back.get("face"))
         return vn_script_image_disp(back.get("path"), back.get("second_path"),
                                     back.get("image_variant", "image"))
